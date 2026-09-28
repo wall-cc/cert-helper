@@ -1,0 +1,68 @@
+// cert_helper.proto
+//
+// ЭТА СХЕМА НЕ ИСПОЛЬЗУЕТСЯ КАК ФАКТИЧЕСКИЙ WIRE-ФОРМАТ.
+//
+// Реализация использует самодельный бинарный протокол
+// (include/cert_helper/protocol.hpp) — см. обоснование решения по
+// открытому вопросу №1 ТЗ там же и в README.md проекта.
+//
+// Этот файл сохранён в репозитории как:
+//   1) документация "целевой" схемы сообщений в общепонятной, независимой
+//      от языка нотации — удобно для code review протокола, не читая C++;
+//   2) отправная точка, если протокол в будущем разрастётся настолько,
+//      что миграция на настоящий Protocol Buffers станет оправданной —
+//      тогда эта схема (адаптированная под актуальный набор полей) может
+//      быть взята за основу вместо проектирования с нуля.
+//
+// Схема ниже семантически соответствует protocol.hpp на момент написания,
+// но НЕ гарантированно синхронизирована при последующих изменениях
+// protocol.hpp — при использовании как документации сверяйтесь с кодом.
+
+syntax = "proto3";
+package cert_helper;
+
+message FetchOcspRequest {
+    string responder_url = 1;
+    bytes request_der = 2;
+    uint32 timeout_ms = 3;
+}
+
+message FetchCrlRequest {
+    string distribution_point_url = 1;
+    uint32 timeout_ms = 2;
+}
+
+message FetchIntermediateCertRequest {
+    string aia_url = 1; // caIssuers URL из AIA-расширения
+    uint32 timeout_ms = 2;
+}
+
+message HealthCheckRequest {}
+
+enum FetchStatus {
+    OK = 0;
+    TIMEOUT = 1;
+    NETWORK_ERROR = 2;
+    INVALID_RESPONSE = 3;
+}
+
+message FetchResponse {
+    FetchStatus status = 1;
+    bytes payload_der = 2;
+    bool from_cache = 3;
+}
+
+message HealthCheckResponse {
+    bool healthy = 1;
+    uint64 cache_entries = 2;
+    uint64 cache_size_bytes = 3;
+}
+
+message Request {
+    oneof kind {
+        FetchOcspRequest ocsp = 1;
+        FetchCrlRequest crl = 2;
+        FetchIntermediateCertRequest intermediate_cert = 3;
+        HealthCheckRequest health_check = 4;
+    }
+}

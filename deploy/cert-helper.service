@@ -1,0 +1,70 @@
+[Unit]
+Description=cert-helper: TLS certificate fetch/cache helper daemon for tls-mitm
+Documentation=https://internal/cert-helper/README.md
+After=network-online.target dbus.service
+Wants=network-online.target
+Requires=dbus.service
+
+[Service]
+# Type=dbus + BusName= — systemd не считает сервис "запущенным" (для целей
+# зависимостей/After=cert-helper.service у других юнитов), пока процесс не
+# зарегистрирует именно это well-known имя на шине. Это надёжнее, чем
+# Type=simple: не нужно гадать по времени/логам, готов ли демон принимать
+# вызовы — готовность равна факту владения именем на D-Bus.
+Type=dbus
+BusName=org.certhelper.CertHelper1
+
+ExecStart=/usr/local/bin/cert-helper \
+    --cache-dir /var/lib/cert-helper/cache \
+    --worker-threads 4 \
+    --max-cache-entries 100000 \
+    --max-cache-bytes 536870912 \
+    --aia-ttl-seconds 604800
+
+# Непривилегированный пользователь/группа. Доступ клиентов теперь
+# регулируется не правами файла сокета (как было для UDS), а D-Bus
+# policy-файлом на системной шине — см.
+# deploy/org.certhelper.CertHelper1.conf. Он разрешает ИМЕННО этому
+# пользователю own() well-known имя на шине.
+User=cert-helper
+Group=cert-helper
+
+StateDirectory=cert-helper
+StateDirectoryMode=0750
+
+Restart=on-failure
+RestartSec=2s
+
+# --- systemd hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cert-helper
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# AF_UNIX обязателен — весь D-Bus IPC (системная шина) идёт через Unix
+# domain socket, независимо от того, что "видимый" протокол — D-Bus, а не
+# сырой UDS напрямую. AF_INET/AF_INET6 — для исходящих HTTP-запросов к
+# OCSP/CRL/AIA-серверам (см. http_client.hpp).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount
+
+# Демону нужен исходящий сетевой доступ только к 80/443 (в первой версии —
+# только 80, см. http_client.hpp; 443 оставлен в allowlist на случай
+# будущей поддержки https:// в редких нестандартных AIA/OCSP/CDP URL).
+# systemd IPAddressAllow сам по себе не фильтрует по портам — port-level
+# ограничение делается вне юнит-файла (iptables/nftables egress-правило
+# для UID cert-helper), если оно нужно в конкретном окружении.
+
+[Install]
+WantedBy=multi-user.target
