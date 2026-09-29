@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "../logging.hpp"
+
 namespace cert_helper::ipc {
 
 namespace proto = cert_helper::protocol;
@@ -74,20 +76,20 @@ bool DbusServer::start() {
         if (r >= 0) r = sd_bus_start(bus);
     }
     if (r < 0) {
-        std::fprintf(stderr, "cert-helper: failed to connect to D-Bus: %s\n", std::strerror(-r));
+        log::error("dbus", "failed to connect to D-Bus", {log::field("error", std::strerror(-r))});
         return false;
     }
 
     r = sd_bus_add_object_vtable(bus, &slot, kObjectPath, kInterfaceName, kVtable, this);
     if (r < 0) {
-        std::fprintf(stderr, "cert-helper: failed to register D-Bus object: %s\n", std::strerror(-r));
+        log::error("dbus", "failed to register D-Bus object", {log::field("error", std::strerror(-r))});
         return false;
     }
 
     r = sd_bus_request_name(bus, config.well_known_name.c_str(), 0);
     if (r < 0) {
-        std::fprintf(stderr, "cert-helper: failed to acquire bus name %s: %s\n",
-                      config.well_known_name.c_str(), std::strerror(-r));
+        log::error("dbus", "failed to acquire bus name",
+                   {log::field("bus_name", config.well_known_name), log::field("error", std::strerror(-r))});
         return false;
     }
 
@@ -138,7 +140,7 @@ void DbusServer::bus_loop() {
             // Соединение развалилось — не пытаемся оживить его молча,
             // просто останавливаем демон (systemd/эксплуатация поднимет
             // заново по Restart=on-failure).
-            std::fprintf(stderr, "cert-helper: sd_bus_process() failed: %s\n", std::strerror(-r));
+            log::error("dbus", "sd_bus_process() failed, stopping", {log::field("error", std::strerror(-r))});
             running = false;
             break;
         }
@@ -148,7 +150,7 @@ void DbusServer::bus_loop() {
         // перепроверять running и штатно завершиться при остановке демона.
         r = sd_bus_wait(bus, 200000 /* 200ms в микросекундах */);
         if (r < 0 && r != -EINTR) {
-            std::fprintf(stderr, "cert-helper: sd_bus_wait() failed: %s\n", std::strerror(-r));
+            log::error("dbus", "sd_bus_wait() failed, stopping", {log::field("error", std::strerror(-r))});
             running = false;
             break;
         }

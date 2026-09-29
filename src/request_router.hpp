@@ -172,6 +172,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include <openssl/bn.h>
 #include <openssl/objects.h>
 #include <openssl/ocsp.h>
 #include <openssl/pkcs7.h>
@@ -179,6 +180,7 @@
 #include <openssl/x509.h>
 
 #include "aia.hpp"
+#include "audit_log.hpp"
 #include "cache/cache_store.hpp"
 #include "http_client.hpp"
 #include "ldap_client.hpp"
@@ -232,14 +234,22 @@ public:
         uint32_t circuit_breaker_max_tracked_hosts = 10000; // защита от неограниченного роста карты
     };
 
+    // audit_sink — ROADMAP.md, раздел 4, пункт 23: приёмник аудит-событий
+    // (см. audit_log.hpp); nullptr (по умолчанию) — аудит выключен.
+    // Не владеющий указатель, время жизни — на вызывающем.
     RequestRouter(cache::ICacheStore& cache_store, http::IHttpFetcher& http_fetcher, Config config,
-                  ldap::ILdapFetcher* ldap_fetcher = nullptr)
-        : cache_store(cache_store), http_fetcher(http_fetcher), config(config), ldap_fetcher(ldap_fetcher) {}
+                  ldap::ILdapFetcher* ldap_fetcher = nullptr, audit::IAuditSink* audit_sink = nullptr)
+        : cache_store(cache_store), http_fetcher(http_fetcher), config(config), ldap_fetcher(ldap_fetcher),
+          audit_sink_(audit_sink) {}
 
     proto::FetchResponse handle_ocsp(const proto::FetchOcspRequest& req) {
         std::string key = "ocsp|" + req.responder_url + "|" + ocsp_request_cache_fingerprint(req.request_der);
-        proto::FetchResponse resp = singleflight_execute(key, [this, &req] { return handle_ocsp_impl(req); });
+        const auto started = std::chrono::steady_clock::now();
+        AuditDetail detail;
+        proto::FetchResponse resp =
+            singleflight_execute(key, [this, &req, &detail] { return handle_ocsp_impl(req, detail); });
         record_stats(ocsp_stats, resp);
+        audit_ocsp(req, resp, detail, elapsed_ms_since(started), /*batch_size=*/0);
         return resp;
     }
 
@@ -286,6 +296,9 @@ public:
                 resp.status = proto::FetchStatus::Ok;
                 resp.payload_der = cached->payload;
                 resp.from_cache = true;
+                AuditDetail cache_detail;
+                cache_detail.executed = true;
+                audit_ocsp(req, resp, cache_detail, /*duration_ms=*/0, /*batch_size=*/0);
                 batch_resp.responses[i] = std::move(resp);
             } else {
                 miss_indices_by_url[req.responder_url].push_back(i);
@@ -316,15 +329,23 @@ public:
                 combined_timeout_ms = std::max(combined_timeout_ms, batch_req.requests[i].timeout_ms);
             }
 
+            const auto group_started = std::chrono::steady_clock::now();
             auto http_result = fetch_with_retry_and_circuit_breaker(
                 http::Method::Post, responder_url, *combined_der, "application/ocsp-request",
                 combined_timeout_ms, config.max_ocsp_response_bytes);
             proto::FetchResponse combined_resp = classify_http_result(http_result);
+            AuditDetail group_detail; // один HTTP round-trip на всю группу — одни и те же детали для всех
+            group_detail.executed = true;
+            group_detail.note_http(http_result);
+            const uint64_t group_ms = elapsed_ms_since(group_started);
 
             if (combined_resp.status != proto::FetchStatus::Ok) {
                 // Единственный round-trip был общим — его исход общий для
                 // всех участников группы.
-                for (size_t i : indices) batch_resp.responses[i] = combined_resp;
+                for (size_t i : indices) {
+                    batch_resp.responses[i] = combined_resp;
+                    audit_ocsp(batch_req.requests[i], combined_resp, group_detail, group_ms, indices.size());
+                }
                 continue;
             }
 
@@ -340,6 +361,7 @@ public:
                 store_in_cache(cache::EntryKind::Ocsp, cache_key, combined_resp.payload_der, ttl);
 
                 batch_resp.responses[i] = combined_resp; // тот же payload_der для каждого — см. protocol.hpp
+                audit_ocsp(req, combined_resp, group_detail, group_ms, indices.size());
             }
         }
 
@@ -351,16 +373,24 @@ public:
 
     proto::FetchResponse handle_crl(const proto::FetchCrlRequest& req) {
         std::string key = "crl|" + req.distribution_point_url;
-        proto::FetchResponse resp = singleflight_execute(key, [this, &req] { return handle_crl_impl(req); });
+        const auto started = std::chrono::steady_clock::now();
+        AuditDetail detail;
+        proto::FetchResponse resp =
+            singleflight_execute(key, [this, &req, &detail] { return handle_crl_impl(req, detail); });
         record_stats(crl_stats, resp);
+        audit_simple(audit::RequestType::Crl, req.distribution_point_url, resp, detail,
+                     elapsed_ms_since(started));
         return resp;
     }
 
     proto::FetchResponse handle_intermediate_cert(const proto::FetchIntermediateCertRequest& req) {
         std::string key = "aia|" + req.aia_url;
-        proto::FetchResponse resp =
-            singleflight_execute(key, [this, &req] { return handle_intermediate_cert_impl(req); });
+        const auto started = std::chrono::steady_clock::now();
+        AuditDetail detail;
+        proto::FetchResponse resp = singleflight_execute(
+            key, [this, &req, &detail] { return handle_intermediate_cert_impl(req, detail); });
         record_stats(intermediate_cert_stats, resp);
+        audit_simple(audit::RequestType::Aia, req.aia_url, resp, detail, elapsed_ms_since(started));
         return resp;
     }
 
@@ -379,6 +409,28 @@ public:
     }
 
 private:
+    // ROADMAP.md, раздел 4, пункт 23: подробности исполнения запроса,
+    // которые знает только impl-функция (лидер singleflight), а публичный
+    // handle_*() — обёртка, эмитящая аудит-событие, — сам не видит.
+    // ПОЧЕМУ ЛОКАЛЬНАЯ ПЕРЕМЕННАЯ В ОБЁРТКЕ, А НЕ РЕЗУЛЬТАТ SINGLEFLIGHT:
+    // лямбда с handle_*_impl выполняется только в потоке-лидере;
+    // последователи (пришли с тем же ключом, пока лидер работал)
+    // получают готовый FetchResponse и до impl не доходят. Поэтому если
+    // после singleflight_execute() executed остался false — этот вызов был
+    // последователем, и решение для аудита — shared_inflight. Так не нужно
+    // менять сигнатуру singleflight_execute() и протаскивать метаданные
+    // через разделяемое состояние.
+    struct AuditDetail {
+        bool executed = false;   // impl выполнялся в этом потоке
+        std::string reason;      // непусто => демон сам отказался (blocked), см. audit_log.hpp
+        int http_status = 0;
+
+        void note_http(const http::HttpResult& r) {
+            http_status = r.status_code;
+            reason = http::failure_reason_name(r.failure_reason);
+        }
+    };
+
     // Счётчики наблюдаемости по типу запроса (пункт 5 из анализа Squid).
     // std::memory_order_relaxed достаточно — это просто счётчики для
     // диагностики/мониторинга, не синхронизационный примитив; нам не
@@ -653,7 +705,9 @@ private:
                                                             size_t max_response_bytes) {
         auto host_port = host_port_key(url);
         if (host_port && circuit_should_fail_fast(*host_port)) {
-            return http::HttpResult{}; // ok=false по умолчанию
+            http::HttpResult blocked; // ok=false по умолчанию
+            blocked.failure_reason = http::FailureReason::CircuitOpen; // для аудита (п.23)
+            return blocked;
         }
 
         auto result =
@@ -675,10 +729,14 @@ private:
     // конце для всех своих элементов одинаково — см. комментарий там).
     void fetch_single_ocsp_into_batch(const proto::FetchOcspRequest& req, proto::FetchResponse& out) {
         std::string key = "ocsp|" + req.responder_url + "|" + ocsp_request_cache_fingerprint(req.request_der);
-        out = singleflight_execute(key, [this, &req] { return handle_ocsp_impl(req); });
+        const auto started = std::chrono::steady_clock::now();
+        AuditDetail detail;
+        out = singleflight_execute(key, [this, &req, &detail] { return handle_ocsp_impl(req, detail); });
+        audit_ocsp(req, out, detail, elapsed_ms_since(started), /*batch_size=*/0);
     }
 
-    proto::FetchResponse handle_ocsp_impl(const proto::FetchOcspRequest& req) {
+    proto::FetchResponse handle_ocsp_impl(const proto::FetchOcspRequest& req, AuditDetail& detail) {
+        detail.executed = true; // мы — лидер singleflight (последователи сюда не заходят)
         std::string cache_key = req.responder_url + "|" + ocsp_request_cache_fingerprint(req.request_der);
 
         if (auto cached = cache_store.get(cache::EntryKind::Ocsp, cache_key)) {
@@ -692,6 +750,7 @@ private:
         auto http_result = fetch_with_retry_and_circuit_breaker(http::Method::Post, req.responder_url, req.request_der,
                                         "application/ocsp-request", req.timeout_ms,
                                         config.max_ocsp_response_bytes);
+        detail.note_http(http_result);
         proto::FetchResponse resp = classify_http_result(http_result);
         if (resp.status != proto::FetchStatus::Ok) return resp;
 
@@ -701,7 +760,8 @@ private:
         return resp;
     }
 
-    proto::FetchResponse handle_crl_impl(const proto::FetchCrlRequest& req) {
+    proto::FetchResponse handle_crl_impl(const proto::FetchCrlRequest& req, AuditDetail& detail) {
+        detail.executed = true;
         std::string cache_key = req.distribution_point_url;
 
         if (auto cached = cache_store.get(cache::EntryKind::Crl, cache_key)) {
@@ -721,11 +781,12 @@ private:
         // ограничений (anonymous-only bind, без TLS, без пустого host,
         // ограниченное подмножество Filter).
         if (req.distribution_point_url.compare(0, 7, "ldap://") == 0) {
-            return handle_crl_via_ldap(req, cache_key);
+            return handle_crl_via_ldap(req, cache_key, detail);
         }
 
         auto http_result = fetch_with_retry_and_circuit_breaker(http::Method::Get, req.distribution_point_url, {}, "",
                                         req.timeout_ms, config.max_crl_response_bytes);
+        detail.note_http(http_result);
         proto::FetchResponse resp = classify_http_result(http_result);
         if (resp.status != proto::FetchStatus::Ok) return resp;
 
@@ -735,9 +796,11 @@ private:
         return resp;
     }
 
-    proto::FetchResponse handle_crl_via_ldap(const proto::FetchCrlRequest& req, const std::string& cache_key) {
+    proto::FetchResponse handle_crl_via_ldap(const proto::FetchCrlRequest& req, const std::string& cache_key,
+                                              AuditDetail& detail) {
         proto::FetchResponse resp;
         if (ldap_fetcher == nullptr) {
+            detail.reason = "ldap_disabled";
             // --allow-ldap не включён (см. daemon_main.cpp) — тот же
             // осознанный "fail closed по умолчанию", что и для https://
             // (ROADMAP.md п.7): новая, неаудированная поверхность разбора
@@ -758,6 +821,7 @@ private:
             ldap_fetcher->fetch(req.distribution_point_url, "certificateRevocationList;binary",
                                  req.timeout_ms, config.max_crl_response_bytes);
         if (!ldap_result.ok) {
+            if (ldap_result.policy_denied) detail.reason = "policy_denied";
             resp.status = proto::FetchStatus::NetworkError;
             return resp;
         }
@@ -774,7 +838,9 @@ private:
         return resp;
     }
 
-    proto::FetchResponse handle_intermediate_cert_impl(const proto::FetchIntermediateCertRequest& req) {
+    proto::FetchResponse handle_intermediate_cert_impl(const proto::FetchIntermediateCertRequest& req,
+                                                        AuditDetail& detail) {
+        detail.executed = true;
         std::string cache_key = req.aia_url;
 
         if (auto cached = cache_store.get(cache::EntryKind::IntermediateCert, cache_key)) {
@@ -787,6 +853,7 @@ private:
 
         auto http_result = fetch_with_retry_and_circuit_breaker(http::Method::Get, req.aia_url, {}, "", req.timeout_ms,
                                         config.max_aia_response_bytes);
+        detail.note_http(http_result);
         proto::FetchResponse resp = classify_http_result(http_result);
         if (resp.status != proto::FetchStatus::Ok) return resp;
 
@@ -850,6 +917,81 @@ private:
         resp.payload_der = r.body;
         resp.from_cache = false;
         return resp;
+    }
+
+    static uint64_t elapsed_ms_since(std::chrono::steady_clock::time_point started) {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count());
+    }
+
+    static audit::FetchEvent make_audit_event(audit::RequestType type, const std::string& url,
+                                              const proto::FetchResponse& resp, const AuditDetail& detail,
+                                              uint64_t duration_ms) {
+        audit::FetchEvent e;
+        e.type = type;
+        e.url = url;
+        e.result = audit::status_name(resp.status);
+        if (!detail.executed) {
+            e.decision = audit::Decision::SharedInflight;
+        } else if (resp.from_cache) {
+            e.decision = audit::Decision::CacheHit;
+        } else if (!detail.reason.empty()) {
+            e.decision = audit::Decision::Blocked;
+            e.reason = detail.reason;
+        } else {
+            e.decision = audit::Decision::NetworkFetch;
+        }
+        e.bytes = (resp.status == proto::FetchStatus::Ok) ? resp.payload_der.size() : 0;
+        e.duration_ms = duration_ms;
+        e.http_status = detail.http_status;
+        return e;
+    }
+
+    void emit_audit(const audit::FetchEvent& event) {
+        // Аудит не должен ронять/задерживать обработку запроса из-за собственного сбоя.
+        try {
+            audit_sink_->record("fetch", audit::to_fields(event));
+        } catch (...) {
+        }
+    }
+
+    void audit_simple(audit::RequestType type, const std::string& url, const proto::FetchResponse& resp,
+                      const AuditDetail& detail, uint64_t duration_ms) {
+        if (audit_sink_ == nullptr) return;
+        emit_audit(make_audit_event(type, url, resp, detail, duration_ms));
+    }
+
+    void audit_ocsp(const proto::FetchOcspRequest& req, const proto::FetchResponse& resp,
+                    const AuditDetail& detail, uint64_t duration_ms, size_t batch_size) {
+        if (audit_sink_ == nullptr) return; // не тратим время на разбор запроса ради serial
+        audit::FetchEvent e =
+            make_audit_event(audit::RequestType::Ocsp, req.responder_url, resp, detail, duration_ms);
+        e.serial = ocsp_request_serial_hex(req.request_der);
+        e.batch_size = static_cast<uint32_t>(batch_size);
+        emit_audit(e);
+    }
+
+    // Серийный номер проверяемого сертификата (hex, верхний регистр) из
+    // CertID OCSP-запроса; пустая строка, если запрос не разобрался. URL
+    // responder'а один на тысячи сертификатов — без serial аудит не
+    // отвечал бы на вопрос "статус КАКОГО сертификата запрашивали".
+    static std::string ocsp_request_serial_hex(const std::vector<uint8_t>& request_der) {
+        OCSP_CERTID* cert_id = extract_certid_dup(request_der);
+        if (cert_id == nullptr) return {};
+        std::string out;
+        ASN1_INTEGER* serial = nullptr;
+        if (OCSP_id_get0_info(nullptr, nullptr, nullptr, &serial, cert_id) == 1 && serial != nullptr) {
+            if (BIGNUM* bn = ASN1_INTEGER_to_BN(serial, nullptr)) {
+                if (char* hex = BN_bn2hex(bn)) {
+                    out = hex;
+                    OPENSSL_free(hex);
+                }
+                BN_free(bn);
+            }
+        }
+        OCSP_CERTID_free(cert_id);
+        return out;
     }
 
     void store_in_cache(cache::EntryKind kind, const std::string& key,
@@ -1209,6 +1351,8 @@ private:
     // обработки. Не владеющий указатель — время жизни управляется
     // daemon_main.cpp (или тестом), как и для http_fetcher/cache_store.
     ldap::ILdapFetcher* ldap_fetcher = nullptr;
+    // ROADMAP.md, раздел 4, пункт 23: nullptr — аудит выключен.
+    audit::IAuditSink* audit_sink_ = nullptr;
 
     // Счётчики наблюдаемости по типу запроса (пункт 5 из анализа Squid) —
     // живут с момента старта процесса, не персистентны между рестартами
