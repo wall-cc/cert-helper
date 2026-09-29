@@ -90,6 +90,8 @@ if(CERT_HELPER_BUILD_TESTS)
     endfunction()
 
     add_cert_helper_test(test_cache tests/test_cache.cpp)
+    add_cert_helper_test(test_logging tests/test_logging.cpp)
+    add_cert_helper_test(test_audit_log tests/test_audit_log.cpp)
     add_cert_helper_test(test_aia_extraction tests/test_aia_extraction.cpp)
     add_cert_helper_test(test_crl_delta_extraction tests/test_crl_delta_extraction.cpp)
     add_cert_helper_test(test_dns_cache tests/test_dns_cache.cpp)

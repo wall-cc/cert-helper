@@ -68,6 +68,7 @@
 #include <unistd.h>
 
 #include "dns_cache.hpp"
+#include "logging.hpp"
 #include "net_policy.hpp"
 
 namespace cert_helper::ldap {
@@ -393,6 +394,10 @@ inline std::optional<std::vector<uint8_t>> encode_top_level(const std::string& s
 struct LdapResult {
     bool ok = false;
     std::vector<uint8_t> value;
+    // ROADMAP.md, раздел 4, пункт 23 (аудит-лог): запрос не выполнен по
+    // решению сетевой политики (порт не разрешён / все адреса запрещены),
+    // а не из-за сбоя сети — аудит различает эти случаи.
+    bool policy_denied = false;
 };
 
 class ILdapFetcher {
@@ -431,20 +436,25 @@ public:
 
         auto filter_ber = filter::encode_top_level(parsed->filter);
         if (!filter_ber) {
-            std::fprintf(stderr,
-                          "cert-helper: не поддерживаемая конструкция LDAP-фильтра в %s "
-                          "(см. ограничения в ldap_client.hpp)\n",
-                          url.c_str());
+            log::warn("ldap",
+                      "не поддерживаемая конструкция LDAP-фильтра (см. ограничения в ldap_client.hpp)",
+                      {log::field("url", url)});
             return result;
         }
 
         if (!policy_.is_port_allowed(parsed->port)) {
-            std::fprintf(stderr, "cert-helper: policy denied port %u for %s\n", parsed->port, url.c_str());
+            log::warn("ldap", "policy denied port",
+                      {log::field("port", parsed->port), log::field("url", url)});
+            result.policy_denied = true;
             return result;
         }
 
-        int fd = connect_with_timeout(parsed->host, parsed->port, timeout_ms, policy_);
-        if (fd < 0) return result;
+        bool all_addresses_denied = false;
+        int fd = connect_with_timeout(parsed->host, parsed->port, timeout_ms, policy_, &all_addresses_denied);
+        if (fd < 0) {
+            result.policy_denied = all_addresses_denied;
+            return result;
+        }
         set_socket_timeout(fd, timeout_ms);
 
         bool ok = do_bind(fd, timeout_ms, max_response_bytes) &&
@@ -469,12 +479,14 @@ private:
     // адреса при КАЖДОМ вызове, вне зависимости от того, пришёл ли он из
     // кэша — см. dns_cache.hpp про то, почему это критично для безопасности.
     int connect_with_timeout(const std::string& host, uint16_t port, uint32_t timeout_ms,
-                              const net::NetworkPolicy& policy) {
+                              const net::NetworkPolicy& policy, bool* all_addresses_denied = nullptr) {
+        if (all_addresses_denied != nullptr) *all_addresses_denied = false;
         auto addresses = dns_cache_.resolve(host);
         if (addresses.empty()) return -1;
 
         int fd = -1;
         bool saw_policy_denial = false;
+        bool attempted_any = false; // хоть один адрес прошёл политику и мы пытались подключиться
         for (const auto& addr : addresses) {
             struct sockaddr_storage ss;
             socklen_t ss_len = 0;
@@ -483,6 +495,7 @@ private:
                 saw_policy_denial = true;
                 continue;
             }
+            attempted_any = true;
             fd = ::socket(addr.family, SOCK_STREAM, 0);
             if (fd < 0) continue;
             set_socket_timeout(fd, timeout_ms);
@@ -490,11 +503,15 @@ private:
             ::close(fd);
             fd = -1;
         }
-        if (fd < 0 && saw_policy_denial) {
-            std::fprintf(stderr,
-                          "cert-helper: policy denied all resolved addresses for LDAP host %s "
-                          "(possible SSRF attempt via certificate-supplied URL)\n",
-                          host.c_str());
+        // Отказ политики — только если не нашлось ни одного разрешённого
+        // адреса (иначе это обычная сетевая ошибка) — см. такой же
+        // комментарий в http_client.hpp.
+        if (fd < 0 && saw_policy_denial && !attempted_any) {
+            log::warn("ldap",
+                      "policy denied all resolved addresses "
+                      "(possible SSRF attempt via certificate-supplied URL)",
+                      {log::field("host", host)});
+            if (all_addresses_denied != nullptr) *all_addresses_denied = true;
         }
         return fd;
     }

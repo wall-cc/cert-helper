@@ -100,6 +100,7 @@
 #include <openssl/x509v3.h>
 
 #include "dns_cache.hpp"
+#include "logging.hpp"
 #include "net_policy.hpp"
 
 namespace cert_helper::http {
@@ -127,12 +128,42 @@ struct CacheHints {
     std::optional<int64_t> expires_unix;    // Expires: <HTTP-date>, разобранный в unix time
 };
 
+// ROADMAP.md, раздел 4, пункт 23 (аудит-лог): причина, по которой запрос
+// не был выполнен ПО РЕШЕНИЮ самого демона (а не из-за сбоя сети). Раньше
+// все такие случаи сворачивались в безликий ok=false, и аудит не мог
+// отличить "политика запретила подключение" (потенциальная SSRF-попытка
+// через URL из сертификата) от "сервер недоступен". None — обычный
+// исход: запрос дошёл до сети (успешно или с сетевой ошибкой).
+enum class FailureReason : uint8_t {
+    None = 0,
+    InvalidUrl,       // URL не разобран / неподдерживаемая схема
+    HttpsDisabled,    // https:// без --allow-https
+    HttpsUnavailable, // --allow-https, но хранилище доверенных CA не инициализировано
+    PortDenied,       // порт вне --allowed-ports
+    AddressDenied,    // все адреса резолва запрещены сетевой политикой (SSRF-защита)
+    CircuitOpen,      // выставляет RequestRouter: breaker хоста открыт, соединение не пытались
+};
+
+inline const char* failure_reason_name(FailureReason r) {
+    switch (r) {
+        case FailureReason::None: return "";
+        case FailureReason::InvalidUrl: return "invalid_url";
+        case FailureReason::HttpsDisabled: return "https_disabled";
+        case FailureReason::HttpsUnavailable: return "https_unavailable";
+        case FailureReason::PortDenied: return "port_denied";
+        case FailureReason::AddressDenied: return "address_denied";
+        case FailureReason::CircuitOpen: return "circuit_open";
+    }
+    return "";
+}
+
 struct HttpResult {
     bool ok = false;
     int status_code = 0;
     std::vector<uint8_t> body;
     bool timed_out = false;
     CacheHints cache_hints;
+    FailureReason failure_reason = FailureReason::None;
 };
 
 class IHttpFetcher {
@@ -220,13 +251,12 @@ public:
         if (allow_https_) {
             https_ctx_.reset(create_https_ctx(https_ca_bundle_path));
             if (!https_ctx_) {
-                std::fprintf(stderr,
-                              "cert-helper: warning: could not initialize TLS trust store for "
-                              "https:// support (%s) — все https:// запросы будут завершаться "
-                              "NetworkError\n",
-                              https_ca_bundle_path.empty() ? "системный набор корневых "
-                                                              "сертификатов не найден"
-                                                            : ("bundle: " + https_ca_bundle_path).c_str());
+                log::warn("http",
+                          "could not initialize TLS trust store for https:// support — "
+                          "все https:// запросы будут завершаться NetworkError",
+                          {log::field("trust_store", https_ca_bundle_path.empty()
+                                                         ? std::string("system (не найден)")
+                                                         : https_ca_bundle_path)});
             }
         }
     }
@@ -240,6 +270,7 @@ public:
 
         auto parsed = parse_http_url(url);
         if (!parsed) {
+            result.failure_reason = FailureReason::InvalidUrl;
             return result; // ok=false — вызывающий код трактует как NetworkError/InvalidResponse
         }
 
@@ -249,22 +280,23 @@ public:
             // connect_with_timeout(), чтобы демон даже не пытался
             // устанавливать соединение (не тратил время/файловые
             // дескрипторы на URL, который всё равно будет отклонён).
-            std::fprintf(stderr,
-                          "cert-helper: https:// отключён по умолчанию, запрос к %s отклонён "
-                          "(см. --allow-https)\n",
-                          url.c_str());
+            log::info("http", "https:// отключён по умолчанию, запрос отклонён (см. --allow-https)",
+                      {log::field("url", url)});
+            result.failure_reason = FailureReason::HttpsDisabled;
             return result;
         }
         if (parsed->is_https && !https_ctx_) {
             // allow_https=true, но SSL_CTX не удалось создать (см.
             // конструктор) — не деградируем до незашифрованного/
             // неверифицированного запроса, просто отказываем.
+            result.failure_reason = FailureReason::HttpsUnavailable;
             return result;
         }
 
         if (!policy.is_port_allowed(parsed->port)) {
-            std::fprintf(stderr, "cert-helper: policy denied port %u for %s\n", parsed->port,
-                          url.c_str());
+            log::warn("http", "policy denied port",
+                      {log::field("port", parsed->port), log::field("url", url)});
+            result.failure_reason = FailureReason::PortDenied;
             return result;
         }
 
@@ -328,8 +360,10 @@ private:
                                           size_t max_response_bytes) {
         HttpResult result;
 
-        int fd = connect_with_timeout(parsed.host, parsed.port, timeout_ms, policy);
+        bool policy_denied = false;
+        int fd = connect_with_timeout(parsed.host, parsed.port, timeout_ms, policy, &policy_denied);
         if (fd < 0) {
+            if (policy_denied) result.failure_reason = FailureReason::AddressDenied;
             return result;
         }
         set_socket_timeout(fd, timeout_ms);
@@ -498,7 +532,8 @@ private:
     // должно давать способ обойти policy (см. подробное обоснование в
     // dns_cache.hpp).
     int connect_with_timeout(const std::string& host, uint16_t port, uint32_t timeout_ms,
-                              const net::NetworkPolicy& policy) {
+                              const net::NetworkPolicy& policy, bool* policy_denied = nullptr) {
+        if (policy_denied != nullptr) *policy_denied = false;
         auto addresses = dns_cache_.resolve(host);
         if (addresses.empty()) {
             return -1;
@@ -506,6 +541,7 @@ private:
 
         int fd = -1;
         bool saw_policy_denial = false;
+        bool attempted_any = false; // хоть один адрес прошёл политику и мы пытались подключиться
         for (const auto& addr : addresses) {
             struct sockaddr_storage ss;
             socklen_t ss_len = 0;
@@ -520,6 +556,7 @@ private:
                 continue;
             }
 
+            attempted_any = true;
             fd = ::socket(addr.family, SOCK_STREAM, 0);
             if (fd < 0) continue;
 
@@ -531,11 +568,16 @@ private:
             fd = -1;
         }
 
-        if (fd < 0 && saw_policy_denial) {
-            std::fprintf(stderr,
-                          "cert-helper: policy denied all resolved addresses for host %s "
-                          "(possible SSRF attempt via certificate-supplied URL)\n",
-                          host.c_str());
+        // "Запрещены все адреса" — только если ни одного разрешённого не
+        // нашлось. Если часть адресов прошла политику, а connect() всё
+        // равно не удался — это обычная сетевая ошибка, не отказ политики
+        // (важно для аудита: иначе сбой сети выглядел бы как SSRF-попытка).
+        if (fd < 0 && saw_policy_denial && !attempted_any) {
+            log::warn("http",
+                      "policy denied all resolved addresses "
+                      "(possible SSRF attempt via certificate-supplied URL)",
+                      {log::field("host", host)});
+            if (policy_denied != nullptr) *policy_denied = true;
         }
         return fd;
     }

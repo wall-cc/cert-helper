@@ -27,6 +27,15 @@
 //   4. Эластичный пул воркеров — флаги --min-worker-threads/
 //      --max-worker-threads/--worker-idle-timeout-ms.
 //   5. Разбивка HealthCheck по типу запроса — включена всегда, без флагов.
+//
+// Наблюдаемость и эксплуатация (ROADMAP.md, раздел 4):
+//   п.22 — структурированное логирование (src/logging.hpp): флаги
+//          --log-level/--log-format. Сообщения об ошибках разбора
+//          аргументов и вывод --help намеренно идут напрямую в
+//          stderr/stdout, минуя логгер: это интерфейс командной строки,
+//          а не журнал работы демона, и они возникают до его настройки.
+//   п.23 — аудит-лог решений о фетче (src/audit_log.hpp): флаги
+//          --audit-log-file/--audit-log-fsync, по умолчанию выключен.
 
 #include <atomic>
 #include <chrono>
@@ -39,14 +48,18 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 #include <boost/program_options.hpp>
 
+#include "audit_log.hpp"
 #include "cache/cache_store.hpp"
 #include "cache/two_tier_cache.hpp"
 #include "cache_warmup.hpp"
 #include "http_client.hpp"
 #include "ipc/dbus_server.hpp"
 #include "ldap_client.hpp"
+#include "logging.hpp"
 #include "net_policy.hpp"
 #include "request_router.hpp"
 
@@ -102,6 +115,10 @@ int main(int argc, char** argv) {
     bool allow_ldap = false;
     uint32_t dns_cache_ttl_seconds = 0;
     std::string warmup_file;
+    std::string log_level_arg;
+    std::string log_format_arg;
+    std::string audit_log_file;
+    bool audit_log_fsync = false;
 
     po::options_description dbus_opts("D-Bus", kHelpLineLength);
     dbus_opts.add_options()
@@ -213,9 +230,28 @@ int main(int argc, char** argv) {
          "фоновом потоке сразу после старта D-Bus сервера, не блокируя "
          "готовность демона (ROADMAP.md п.15, см. cache_warmup.hpp)");
 
+    po::options_description log_opts("Логирование (ROADMAP.md п.22)", kHelpLineLength);
+    log_opts.add_options()
+        ("log-level", po::value<std::string>(&log_level_arg)->default_value("info"),
+         "минимальный уровень записей диагностического лога: debug|info|warn|error")
+        ("log-format", po::value<std::string>(&log_format_arg)->default_value("text"),
+         "формат диагностического лога: text ([время] [уровень] [компонент] сообщение "
+         "key=value), json (JSON Lines) или journald (структурированные поля "
+         "CH_* через sd_journal_send; если журнал недоступен — текстом в stderr)");
+
+    po::options_description audit_opts("Аудит-лог решений о фетче (ROADMAP.md п.23)", kHelpLineLength);
+    audit_opts.add_options()
+        ("audit-log-file", po::value<std::string>(&audit_log_file)->default_value(""),
+         "путь к append-only журналу (JSON Lines): что докачивали, откуда, с каким "
+         "результатом, когда (пусто = аудит выключен). Если файл не удаётся открыть "
+         "при старте — демон не запускается. Формат и гарантии — см. audit_log.hpp")
+        ("audit-log-fsync", po::bool_switch(&audit_log_fsync),
+         "fsync после каждого события аудита (событие переживает крах ОС/питания; "
+         "медленнее). Действует, только если задан --audit-log-file");
+
     po::options_description visible("cert-helper — вспомогательный демон докачки/проверки сертификатов", kHelpLineLength);
     visible.add_options()("help,h", "показать эту справку");
-    visible.add(dbus_opts).add(cache_opts).add(worker_opts).add(net_opts);
+    visible.add(dbus_opts).add(cache_opts).add(worker_opts).add(net_opts).add(log_opts).add(audit_opts);
 
     po::variables_map vm;
     try {
@@ -230,6 +266,25 @@ int main(int argc, char** argv) {
         std::cout << visible << "\n";
         return 0;
     }
+
+    // Логгер настраиваем первым делом — всё, что ниже, уже пишет через него.
+    // Неверное значение — ошибка использования (как и любой другой
+    // неверный аргумент), поэтому выходим с кодом 2, а не молча берём дефолт.
+    auto parsed_level = cert_helper::log::parse_level(log_level_arg);
+    if (!parsed_level) {
+        std::cerr << "cert-helper: --log-level: неизвестный уровень \"" << log_level_arg
+                  << "\" (ожидается debug|info|warn|error)\n";
+        return 2;
+    }
+    auto parsed_format = cert_helper::log::parse_format(log_format_arg);
+    if (!parsed_format) {
+        std::cerr << "cert-helper: --log-format: неизвестный формат \"" << log_format_arg
+                  << "\" (ожидается text|json|journald)\n";
+        return 2;
+    }
+    cert_helper::log::Logger::instance().set_level(*parsed_level);
+    cert_helper::log::Logger::instance().set_format(*parsed_format);
+    namespace log = cert_helper::log;
 
     if (min_worker_threads < 1) min_worker_threads = 1;
     if (max_worker_threads < min_worker_threads) max_worker_threads = min_worker_threads;
@@ -281,7 +336,28 @@ int main(int argc, char** argv) {
     router_config.circuit_breaker_failure_threshold = circuit_breaker_failure_threshold;
     router_config.circuit_breaker_cooldown_seconds = circuit_breaker_cooldown_seconds;
     router_config.circuit_breaker_max_tracked_hosts = circuit_breaker_max_tracked_hosts;
-    cert_helper::RequestRouter router(cache, http, router_config, ldap_fetcher.get());
+
+    // ROADMAP.md, раздел 4, пункт 23: аудит-лог создаётся, только если явно
+    // задан --audit-log-file. Файл открываем ЗДЕСЬ, до старта D-Bus
+    // сервера: если оператор потребовал аудит, а писать его некуда, —
+    // демон не должен молча начать работать без него (fail closed при
+    // старте; последующие сбои записи запросы не блокируют — см.
+    // "ГАРАНТИИ" в audit_log.hpp).
+    std::unique_ptr<cert_helper::audit::FileAuditLog> audit_log;
+    if (!audit_log_file.empty()) {
+        cert_helper::audit::FileAuditLog::Options audit_options;
+        audit_options.path = audit_log_file;
+        audit_options.fsync_each_event = audit_log_fsync;
+        audit_log = std::make_unique<cert_helper::audit::FileAuditLog>(audit_options);
+        std::string audit_error;
+        if (!audit_log->open(&audit_error)) {
+            log::error("daemon", "cannot open audit log — refusing to start without requested audit",
+                       {log::field("path", audit_log_file), log::field("error", audit_error)});
+            return 1;
+        }
+    }
+
+    cert_helper::RequestRouter router(cache, http, router_config, ldap_fetcher.get(), audit_log.get());
 
     // --- D-Bus сервер: эластичный пул воркеров (пункт 4) ---
     cert_helper::ipc::DbusServer::Config server_config;
@@ -292,18 +368,27 @@ int main(int argc, char** argv) {
     server_config.worker_idle_timeout_ms = worker_idle_timeout_ms;
     cert_helper::ipc::DbusServer server(server_config, router);
 
+    // daemon_start пишем ДО server.start(): воркеры начинают обслуживать
+    // запросы сразу после старта, и первым событием в журнале должна быть
+    // граница запуска, а не чей-то фетч.
+    if (audit_log) {
+        audit_log->record("daemon_start",
+                          {log::field("pid", static_cast<int64_t>(::getpid())), log::field("bus_name", bus_name)});
+    }
+
     if (!server.start()) {
-        std::fprintf(stderr, "cert-helper: failed to start D-Bus service (name=%s)\n",
-                      bus_name.c_str());
+        log::error("daemon", "failed to start D-Bus service", {log::field("bus_name", bus_name)});
+        if (audit_log) audit_log->record("daemon_stop", {log::field("reason", "start_failed")});
         return 1;
     }
 
-    std::fprintf(stderr,
-                  "cert-helper: registered as %s on %s (workers=%d..%d, cache=%s, "
-                  "mem-cache=%s)\n",
-                  bus_name.c_str(), bus_address.empty() ? "system bus" : bus_address.c_str(),
-                  min_worker_threads, max_worker_threads, cache_dir.c_str(),
-                  mem_cache_max_entries == 0 ? "disabled" : "enabled");
+    log::info("daemon", "registered on D-Bus",
+              {log::field("bus_name", bus_name),
+               log::field("bus", bus_address.empty() ? std::string("system bus") : bus_address),
+               log::field("min_workers", min_worker_threads), log::field("max_workers", max_worker_threads),
+               log::field("cache_dir", cache_dir),
+               log::field("mem_cache", mem_cache_max_entries == 0 ? "disabled" : "enabled"),
+               log::field("audit_log", audit_log_file.empty() ? std::string("disabled") : audit_log_file)});
 
     // ROADMAP.md, раздел 2, пункт 15 (P3): прогрев кэша — запускается ПОСЛЕ
     // старта D-Bus сервера, в фоновом потоке, чтобы не задерживать
@@ -328,8 +413,11 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    std::fprintf(stderr, "cert-helper: shutting down\n");
+    log::info("daemon", "shutting down");
     if (warmup_thread.joinable()) warmup_thread.join();
     server.stop();
+    // После server.stop(): воркеры уже остановлены, так что daemon_stop —
+    // гарантированно последнее событие этого запуска.
+    if (audit_log) audit_log->record("daemon_stop", {log::field("reason", "signal")});
     return 0;
 }

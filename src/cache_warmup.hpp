@@ -45,6 +45,7 @@
 #include <openssl/x509.h>
 
 #include "../include/cert_helper/protocol.hpp"
+#include "logging.hpp"
 #include "request_router.hpp"
 
 namespace cert_helper::warmup {
@@ -124,8 +125,7 @@ inline WarmupStats run(const std::string& warmup_file_path, cert_helper::Request
 
     std::ifstream in(warmup_file_path);
     if (!in) {
-        std::fprintf(stderr, "cert-helper: warmup: не удалось открыть файл %s\n",
-                      warmup_file_path.c_str());
+        log::error("warmup", "не удалось открыть файл прогрева", {log::field("file", warmup_file_path)});
         return stats;
     }
 
@@ -140,7 +140,7 @@ inline WarmupStats run(const std::string& warmup_file_path, cert_helper::Request
 
         size_t colon = line.find(':');
         if (colon == std::string::npos) {
-            std::fprintf(stderr, "cert-helper: warmup: не распознана строка (нет ':'): %s\n", line.c_str());
+            log::warn("warmup", "не распознана строка (нет ':')", {log::field("line", line)});
             ++stats.skipped_malformed_lines;
             continue;
         }
@@ -173,10 +173,8 @@ inline WarmupStats run(const std::string& warmup_file_path, cert_helper::Request
                 (last_colon == std::string::npos) ? std::string::npos : rest.rfind(':', last_colon - 1);
             if (last_colon == std::string::npos || second_last_colon == std::string::npos ||
                 second_last_colon == 0) {
-                std::fprintf(stderr,
-                              "cert-helper: warmup: ocsp: ожидается "
-                              "responder_url:cert_path:issuer_path, получено: %s\n",
-                              rest.c_str());
+                log::warn("warmup", "ocsp: ожидается responder_url:cert_path:issuer_path",
+                          {log::field("got", rest)});
                 ++stats.skipped_malformed_lines;
                 continue;
             }
@@ -186,9 +184,8 @@ inline WarmupStats run(const std::string& warmup_file_path, cert_helper::Request
 
             auto request_der = detail::build_ocsp_request_der(cert_path, issuer_path);
             if (!request_der) {
-                std::fprintf(stderr,
-                              "cert-helper: warmup: ocsp: не удалось построить запрос из %s/%s\n",
-                              cert_path.c_str(), issuer_path.c_str());
+                log::warn("warmup", "ocsp: не удалось построить запрос",
+                          {log::field("cert_path", cert_path), log::field("issuer_path", issuer_path)});
                 ++stats.failed;
                 continue;
             }
@@ -199,16 +196,15 @@ inline WarmupStats run(const std::string& warmup_file_path, cert_helper::Request
             auto resp = router.handle_ocsp(req);
             if (resp.status == proto::FetchStatus::Ok) ++stats.succeeded; else ++stats.failed;
         } else {
-            std::fprintf(stderr, "cert-helper: warmup: неизвестный тип записи \"%s\" в строке: %s\n",
-                          kind.c_str(), line.c_str());
+            log::warn("warmup", "неизвестный тип записи",
+                      {log::field("kind", kind), log::field("line", line)});
             ++stats.skipped_malformed_lines;
         }
     }
 
-    std::fprintf(stderr,
-                  "cert-helper: warmup: завершён (успешно=%d, неудачно=%d, "
-                  "нераспознанных строк=%d)\n",
-                  stats.succeeded, stats.failed, stats.skipped_malformed_lines);
+    log::info("warmup", "завершён",
+              {log::field("succeeded", stats.succeeded), log::field("failed", stats.failed),
+               log::field("malformed_lines", stats.skipped_malformed_lines)});
     return stats;
 }
 
