@@ -13,17 +13,19 @@
 
 namespace {
 
-std::vector<uint8_t> read_file(const std::string& path) {
+std::vector<uint8_t> read_file(std::string const& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         std::fprintf(stderr, "cannot open test fixture: %s\n", path.c_str());
         std::exit(1);
     }
-    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in),
+                                std::istreambuf_iterator<char>());
 }
 
-std::string fixture_path(const std::string& name) {
-    // Тесты запускаются из build-директории — путь относительный к корню репозитория.
+std::string fixture_path(std::string const& name) {
+    // Тесты запускаются из build-директории — путь относительный к корню
+    // репозитория.
     return "../test_certs/" + name;
 }
 
@@ -81,19 +83,26 @@ void test_returns_nullopt_for_full_crl_without_delta_indicator() {
 
 void test_handles_malformed_der_gracefully() {
     std::vector<uint8_t> garbage = {0x00, 0x01, 0x02, 0xFF, 0xFE};
-    TEST_CHECK(!cert_helper::crl::extract_freshest_crl_url_from_crl_der(garbage).has_value());
-    TEST_CHECK(!cert_helper::crl::extract_freshest_crl_url_from_cert_der(garbage).has_value());
-    TEST_CHECK(!cert_helper::crl::extract_delta_crl_base_number_der(garbage).has_value());
+    TEST_CHECK(!cert_helper::crl::extract_freshest_crl_url_from_crl_der(garbage)
+                    .has_value());
+    TEST_CHECK(
+        !cert_helper::crl::extract_freshest_crl_url_from_cert_der(garbage)
+             .has_value());
+    TEST_CHECK(!cert_helper::crl::extract_delta_crl_base_number_der(garbage)
+                    .has_value());
 }
 
 void test_handles_empty_input() {
     std::vector<uint8_t> empty;
-    TEST_CHECK(!cert_helper::crl::extract_freshest_crl_url_from_crl_der(empty).has_value());
-    TEST_CHECK(!cert_helper::crl::extract_freshest_crl_url_from_cert_der(empty).has_value());
-    TEST_CHECK(!cert_helper::crl::extract_delta_crl_base_number_der(empty).has_value());
+    TEST_CHECK(!cert_helper::crl::extract_freshest_crl_url_from_crl_der(empty)
+                    .has_value());
+    TEST_CHECK(!cert_helper::crl::extract_freshest_crl_url_from_cert_der(empty)
+                    .has_value());
+    TEST_CHECK(!cert_helper::crl::extract_delta_crl_base_number_der(empty)
+                    .has_value());
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     RUN_TEST(test_extracts_freshest_crl_url_from_crl_when_present);

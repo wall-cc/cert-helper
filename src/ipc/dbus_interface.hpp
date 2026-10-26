@@ -47,14 +47,28 @@
 
 namespace cert_helper::ipc {
 
-inline constexpr const char* kServiceName = "org.certhelper.CertHelper1";
-inline constexpr const char* kObjectPath = "/org/certhelper/CertHelper1";
-inline constexpr const char* kInterfaceName = "org.certhelper.CertHelper1";
+inline constexpr char const* SERVICE_NAME = "org.certhelper.CertHelper1";
+inline constexpr char const* OBJECT_PATH = "/org/certhelper/CertHelper1";
+inline constexpr char const* INTERFACE_NAME = "org.certhelper.CertHelper1";
 
-inline constexpr const char* kMethodFetchOcsp = "FetchOcsp";
-inline constexpr const char* kMethodFetchOcspBatch = "FetchOcspBatch";
-inline constexpr const char* kMethodFetchCrl = "FetchCrl";
-inline constexpr const char* kMethodFetchIntermediateCert = "FetchIntermediateCert";
-inline constexpr const char* kMethodHealthCheck = "HealthCheck";
+inline constexpr char const* METHOD_FETCH_OCSP = "FetchOcsp";
+inline constexpr char const* METHOD_FETCH_OCSP_BATCH = "FetchOcspBatch";
+inline constexpr char const* METHOD_FETCH_CRL = "FetchCrl";
+inline constexpr char const* METHOD_FETCH_INTERMEDIATE_CERT =
+    "FetchIntermediateCert";
+inline constexpr char const* METHOD_HEALTH_CHECK = "HealthCheck";
 
-} // namespace cert_helper::ipc
+// ПУНКТ 2.6 ПЛАНА ДОРАБОТКИ (P0): если обработка Fetch*-запроса падает
+// с НЕОЖИДАННЫМ (не "обычным" FetchStatus::NETWORK_ERROR и т.п., а
+// настоящим C++ исключением — например, сбой парсинга, нехватка памяти)
+// исключением, сервер отвечает этой D-Bus method-error, а не молча
+// превращает её в FetchStatus::NETWORK_ERROR. Это намеренно: клиент
+// должен уметь отличить "сеть не ответила" (штатная, ожидаемая ситуация,
+// под неё уже есть retry/circuit breaker в RequestRouter) от "в
+// cert-helper баг" (ситуация, которую стоит видеть отдельно — в логах,
+// в мониторинге, — а не тихо укладывать в ту же статистику, что обычные
+// сетевые сбои).
+inline constexpr char const* ERROR_INTERNAL_FAILURE =
+    "org.certhelper.CertHelper1.Error.InternalFailure";
+
+}  // namespace cert_helper::ipc

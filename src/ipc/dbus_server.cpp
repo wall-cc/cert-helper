@@ -17,20 +17,21 @@ namespace proto = cert_helper::protocol;
 namespace {
 
 // Статический vtable D-Bus интерфейса cert-helper. Без SD_BUS_METHOD_WITH_NAMES
-// (именование параметров в интроспекции) — сознательно, ради простоты; сигнатуры
-// типов уже задают контракт однозначно, см. dbus_interface.hpp.
-const sd_bus_vtable kVtable[] = {
+// (именование параметров в интроспекции) — сознательно, ради простоты;
+// сигнатуры типов уже задают контракт однозначно, см. dbus_interface.hpp.
+sd_bus_vtable const VTABLE[] = {
     SD_BUS_VTABLE_START(0),
-    SD_BUS_METHOD(kMethodFetchOcsp, "sayu", "yayb", &DbusServer::on_fetch_ocsp,
+    SD_BUS_METHOD(METHOD_FETCH_OCSP, "sayu", "yayb", &DbusServer::on_fetch_ocsp,
                   SD_BUS_VTABLE_UNPRIVILEGED),
-    SD_BUS_METHOD(kMethodFetchOcspBatch, "a(sayu)", "a(yayb)", &DbusServer::on_fetch_ocsp_batch,
+    SD_BUS_METHOD(METHOD_FETCH_OCSP_BATCH, "a(sayu)", "a(yayb)",
+                  &DbusServer::on_fetch_ocsp_batch, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD(METHOD_FETCH_CRL, "su", "yayb", &DbusServer::on_fetch_crl,
                   SD_BUS_VTABLE_UNPRIVILEGED),
-    SD_BUS_METHOD(kMethodFetchCrl, "su", "yayb", &DbusServer::on_fetch_crl,
+    SD_BUS_METHOD(METHOD_FETCH_INTERMEDIATE_CERT, "su", "yayb",
+                  &DbusServer::on_fetch_intermediate_cert,
                   SD_BUS_VTABLE_UNPRIVILEGED),
-    SD_BUS_METHOD(kMethodFetchIntermediateCert, "su", "yayb",
-                  &DbusServer::on_fetch_intermediate_cert, SD_BUS_VTABLE_UNPRIVILEGED),
-    SD_BUS_METHOD(kMethodHealthCheck, "", "bttttttttttttt", &DbusServer::on_health_check,
-                  SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD(METHOD_HEALTH_CHECK, "", "bttttttttttttt",
+                  &DbusServer::on_health_check, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_VTABLE_END,
 };
 
@@ -38,15 +39,19 @@ const sd_bus_vtable kVtable[] = {
 // (y status, ay payload_der, b from_cache) для уже выполненного
 // proto::FetchResponse, на входящее (взятое в ref) сообщение call.
 // Вызывается из воркер-потока, не из bus-потока.
-void send_fetch_reply(sd_bus* bus, sd_bus_message* call, const proto::FetchResponse& resp) {
+void send_fetch_reply(sd_bus* bus, sd_bus_message* call,
+                      proto::FetchResponse const& resp) {
     sd_bus_message* reply = nullptr;
     int r = sd_bus_message_new_method_return(call, &reply);
     if (r >= 0) {
-        r = sd_bus_message_append(reply, "y", static_cast<uint8_t>(resp.status));
+        r = sd_bus_message_append(reply, "y",
+                                  static_cast<uint8_t>(resp.status));
     }
     if (r >= 0) {
-        const void* data = resp.payload_der.empty() ? nullptr : resp.payload_der.data();
-        r = sd_bus_message_append_array(reply, 'y', data, resp.payload_der.size());
+        void const* data =
+            resp.payload_der.empty() ? nullptr : resp.payload_der.data();
+        r = sd_bus_message_append_array(reply, 'y', data,
+                                        resp.payload_der.size());
     }
     if (r >= 0) {
         r = sd_bus_message_append(reply, "b", resp.from_cache ? 1 : 0);
@@ -54,11 +59,46 @@ void send_fetch_reply(sd_bus* bus, sd_bus_message* call, const proto::FetchRespo
     if (r >= 0) {
         sd_bus_send(bus, reply, nullptr);
     }
-    if (reply != nullptr) sd_bus_message_unref(reply);
+    if (reply != nullptr) {
+        sd_bus_message_unref(reply);
+    }
     sd_bus_message_unref(call);
 }
 
-} // namespace
+// ПУНКТ 2.6 ПЛАНА ДОРАБОТКИ (P0): единая точка отправки ответа, когда
+// обработка запроса в воркер-потоке упала с НЕОЖИДАННЫМ C++
+// исключением (не штатным FetchStatus — для него используется
+// send_fetch_reply() выше). Без этого исключение добралось бы до
+// worker_loop() (см. комментарий там) и убило бы процесс целиком через
+// std::terminate() — единственный транзиентный сбой на одном URL
+// превращался бы в падение всего MITM TLS-модуля. См. также
+// ERROR_INTERNAL_FAILURE в dbus_interface.hpp.
+void send_internal_error_reply(sd_bus* bus, sd_bus_message* call,
+                               std::exception_ptr error) {
+    std::string what = "unknown error";
+    try {
+        std::rethrow_exception(error);
+    } catch (std::exception const& e) {
+        what = e.what();
+    } catch (...) {
+        // неизвестный тип исключения — оставляем "unknown error"
+    }
+    log::error("dbus", "request handler threw an unexpected exception",
+               {log::field("error", what)});
+
+    sd_bus_message* reply = nullptr;
+    int r = sd_bus_message_new_method_errorf(
+        call, &reply, ERROR_INTERNAL_FAILURE, "cert-helper: %s", what.c_str());
+    if (r >= 0) {
+        sd_bus_send(bus, reply, nullptr);
+    }
+    if (reply != nullptr) {
+        sd_bus_message_unref(reply);
+    }
+    sd_bus_message_unref(call);
+}
+
+}  // namespace
 
 DbusServer::DbusServer(Config config, RequestRouter& router)
     : config(std::move(config)), router(router) {}
@@ -71,25 +111,35 @@ bool DbusServer::start() {
         r = sd_bus_open_system(&bus);
     } else {
         r = sd_bus_new(&bus);
-        if (r >= 0) r = sd_bus_set_address(bus, config.bus_address.c_str());
-        if (r >= 0) r = sd_bus_set_bus_client(bus, 1);
-        if (r >= 0) r = sd_bus_start(bus);
+        if (r >= 0) {
+            r = sd_bus_set_address(bus, config.bus_address.c_str());
+        }
+        if (r >= 0) {
+            r = sd_bus_set_bus_client(bus, 1);
+        }
+        if (r >= 0) {
+            r = sd_bus_start(bus);
+        }
     }
     if (r < 0) {
-        log::error("dbus", "failed to connect to D-Bus", {log::field("error", std::strerror(-r))});
+        log::error("dbus", "failed to connect to D-Bus",
+                   {log::field("error", std::strerror(-r))});
         return false;
     }
 
-    r = sd_bus_add_object_vtable(bus, &slot, kObjectPath, kInterfaceName, kVtable, this);
+    r = sd_bus_add_object_vtable(bus, &slot, OBJECT_PATH, INTERFACE_NAME,
+                                 VTABLE, this);
     if (r < 0) {
-        log::error("dbus", "failed to register D-Bus object", {log::field("error", std::strerror(-r))});
+        log::error("dbus", "failed to register D-Bus object",
+                   {log::field("error", std::strerror(-r))});
         return false;
     }
 
     r = sd_bus_request_name(bus, config.well_known_name.c_str(), 0);
     if (r < 0) {
         log::error("dbus", "failed to acquire bus name",
-                   {log::field("bus_name", config.well_known_name), log::field("error", std::strerror(-r))});
+                   {log::field("bus_name", config.well_known_name),
+                    log::field("error", std::strerror(-r))});
         return false;
     }
 
@@ -103,9 +153,13 @@ bool DbusServer::start() {
 }
 
 void DbusServer::stop() {
-    if (!running.exchange(false)) return;
+    if (!running.exchange(false)) {
+        return;
+    }
 
-    if (bus_thread.joinable()) bus_thread.join();
+    if (bus_thread.joinable()) {
+        bus_thread.join();
+    }
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex);
@@ -113,7 +167,9 @@ void DbusServer::stop() {
     }
     queue_cv.notify_all();
     for (auto& t : workers) {
-        if (t.joinable()) t.join();
+        if (t.joinable()) {
+            t.join();
+        }
     }
     workers.clear();
 
@@ -140,17 +196,22 @@ void DbusServer::bus_loop() {
             // Соединение развалилось — не пытаемся оживить его молча,
             // просто останавливаем демон (systemd/эксплуатация поднимет
             // заново по Restart=on-failure).
-            log::error("dbus", "sd_bus_process() failed, stopping", {log::field("error", std::strerror(-r))});
+            log::error("dbus", "sd_bus_process() failed, stopping",
+                       {log::field("error", std::strerror(-r))});
             running = false;
             break;
         }
-        if (r > 0) continue; // обработали событие — сразу проверяем следующее, не ждём
+        if (r > 0) {
+            continue;  // обработали событие — сразу проверяем следующее, не
+                       // ждём
+        }
 
         // Короткий таймаут (не бесконечный sd_bus_wait), чтобы periodически
         // перепроверять running и штатно завершиться при остановке демона.
         r = sd_bus_wait(bus, 200000 /* 200ms в микросекундах */);
         if (r < 0 && r != -EINTR) {
-            log::error("dbus", "sd_bus_wait() failed, stopping", {log::field("error", std::strerror(-r))});
+            log::error("dbus", "sd_bus_wait() failed, stopping",
+                       {log::field("error", std::strerror(-r))});
             running = false;
             break;
         }
@@ -159,14 +220,16 @@ void DbusServer::bus_loop() {
 
 void DbusServer::worker_loop() {
     using namespace std::chrono_literals;
-    const auto idle_timeout = std::chrono::milliseconds(config.worker_idle_timeout_ms);
+    auto const idle_timeout =
+        std::chrono::milliseconds(config.worker_idle_timeout_ms);
 
     while (true) {
         PendingJob job;
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            bool got_job = queue_cv.wait_for(lock, idle_timeout,
-                                                [this] { return stopping || !jobs.empty(); });
+            bool got_job = queue_cv.wait_for(lock, idle_timeout, [this] {
+                return stopping || !jobs.empty();
+            });
             if (stopping && jobs.empty()) {
                 active_workers.fetch_sub(1, std::memory_order_relaxed);
                 return;
@@ -176,16 +239,36 @@ void DbusServer::worker_loop() {
                 // самозавершаемся, но только если это не опустит пул
                 // ниже минимума (пункт 4: "startup" воркеров всегда
                 // остаются в строю, "лишние" под нагрузкой — уходят).
-                if (active_workers.load(std::memory_order_relaxed) > config.min_worker_threads) {
+                if (active_workers.load(std::memory_order_relaxed) >
+                    config.min_worker_threads) {
                     active_workers.fetch_sub(1, std::memory_order_relaxed);
                     return;
                 }
-                continue; // остаёмся в пуле как часть минимума, ждём дальше
+                continue;  // остаёмся в пуле как часть минимума, ждём дальше
             }
             job = std::move(jobs.front());
             jobs.pop_front();
         }
-        job.run();
+        // Защита последней линии (ПУНКТ 2.6 ПЛАНА ДОРАБОТКИ, P0): каждый
+        // из четырёх on_fetch_*-обработчиков уже оборачивает свою работу
+        // в try/catch и отвечает ERROR_INTERNAL_FAILURE по D-Bus (см.
+        // send_internal_error_reply). Этот catch — НЕ замена тому, а
+        // подстраховка: необработанное исключение здесь означало бы
+        // std::terminate() этого потока, а поскольку это точка входа
+        // std::thread — не просто поток, а ВЕСЬ ПРОЦЕСС демона целиком,
+        // без шанса на graceful restart. Раз уж сюда дошло — ответ
+        // клиенту по D-Bus отправить уже некем (bus/call в этой лямбде
+        // не видны), так что остаётся только залогировать и не дать
+        // процессу упасть.
+        try {
+            job.run();
+        } catch (std::exception const& e) {
+            log::error("dbus", "unhandled exception escaped worker job",
+                       {log::field("error", e.what())});
+        } catch (...) {
+            log::error("dbus", "unhandled exception escaped worker job",
+                       {log::field("error", "unknown")});
+        }
     }
 }
 
@@ -212,33 +295,45 @@ void DbusServer::maybe_spawn_worker() {
         std::lock_guard<std::mutex> lock(queue_mutex);
         queue_len = jobs.size();
     }
-    if (queue_len <= 1) return;
-    if (active_workers.load(std::memory_order_relaxed) >= config.max_worker_threads) return;
+    if (queue_len <= 1) {
+        return;
+    }
+    if (active_workers.load(std::memory_order_relaxed) >=
+        config.max_worker_threads) {
+        return;
+    }
 
     active_workers.fetch_add(1, std::memory_order_relaxed);
     workers.emplace_back([this] { worker_loop(); });
 }
 
-int DbusServer::on_fetch_ocsp(sd_bus_message* m, void* userdata, sd_bus_error* /*ret_error*/) {
+int DbusServer::on_fetch_ocsp(sd_bus_message* m, void* userdata,
+                              sd_bus_error* /*ret_error*/) {
     auto* self = static_cast<DbusServer*>(userdata);
 
-    const char* url = nullptr;
-    const void* der_ptr = nullptr;
+    char const* url = nullptr;
+    void const* der_ptr = nullptr;
     size_t der_len = 0;
     uint32_t timeout_ms = 0;
 
     int r = sd_bus_message_read(m, "s", &url);
-    if (r < 0) return r;
+    if (r < 0) {
+        return r;
+    }
     r = sd_bus_message_read_array(m, 'y', &der_ptr, &der_len);
-    if (r < 0) return r;
+    if (r < 0) {
+        return r;
+    }
     r = sd_bus_message_read(m, "u", &timeout_ms);
-    if (r < 0) return r;
+    if (r < 0) {
+        return r;
+    }
 
     proto::FetchOcspRequest req;
     req.responder_url = url;
     if (der_len > 0) {
-        req.request_der.assign(static_cast<const uint8_t*>(der_ptr),
-                                static_cast<const uint8_t*>(der_ptr) + der_len);
+        req.request_der.assign(static_cast<uint8_t const*>(der_ptr),
+                               static_cast<uint8_t const*>(der_ptr) + der_len);
     }
     req.timeout_ms = timeout_ms;
 
@@ -246,10 +341,14 @@ int DbusServer::on_fetch_ocsp(sd_bus_message* m, void* userdata, sd_bus_error* /
     sd_bus* bus = sd_bus_message_get_bus(m);
 
     self->enqueue([self, bus, call, req = std::move(req)]() mutable {
-        auto resp = self->router.handle_ocsp(req);
-        send_fetch_reply(bus, call, resp);
+        try {
+            auto resp = self->router.handle_ocsp(req);
+            send_fetch_reply(bus, call, resp);
+        } catch (...) {
+            send_internal_error_reply(bus, call, std::current_exception());
+        }
     });
-    return 1; // ответ будет отправлен асинхронно из воркера
+    return 1;  // ответ будет отправлен асинхронно из воркера
 }
 
 // ROADMAP.md, раздел 2, пункт 14: FetchOcspBatch(a(sayu)) -> a(yayb).
@@ -258,86 +357,139 @@ int DbusServer::on_fetch_ocsp(sd_bus_message* m, void* userdata, sd_bus_error* /
 // за раз — sd-bus не даёт "прочитать весь массив структур одним вызовом"
 // для неоднородных по типам структур (в отличие от 'ay', это не простой
 // массив байт), только поэлементный обход контейнера.
-int DbusServer::on_fetch_ocsp_batch(sd_bus_message* m, void* userdata, sd_bus_error* /*ret_error*/) {
+int DbusServer::on_fetch_ocsp_batch(sd_bus_message* m, void* userdata,
+                                    sd_bus_error* /*ret_error*/) {
     auto* self = static_cast<DbusServer*>(userdata);
 
     proto::FetchOcspBatchRequest batch_req;
 
     int r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "(sayu)");
-    if (r < 0) return r;
+    if (r < 0) {
+        return r;
+    }
 
     while (true) {
         r = sd_bus_message_enter_container(m, SD_BUS_TYPE_STRUCT, "sayu");
-        if (r < 0) return r;
-        if (r == 0) break; // элементы массива кончились
+        if (r < 0) {
+            return r;
+        }
+        if (r == 0) {
+            break;  // элементы массива кончились
+        }
 
-        const char* url = nullptr;
-        const void* der_ptr = nullptr;
+        char const* url = nullptr;
+        void const* der_ptr = nullptr;
         size_t der_len = 0;
         uint32_t timeout_ms = 0;
 
         r = sd_bus_message_read(m, "s", &url);
-        if (r < 0) return r;
+        if (r < 0) {
+            return r;
+        }
         r = sd_bus_message_read_array(m, 'y', &der_ptr, &der_len);
-        if (r < 0) return r;
+        if (r < 0) {
+            return r;
+        }
         r = sd_bus_message_read(m, "u", &timeout_ms);
-        if (r < 0) return r;
+        if (r < 0) {
+            return r;
+        }
 
         proto::FetchOcspRequest req;
         req.responder_url = url;
         if (der_len > 0) {
-            req.request_der.assign(static_cast<const uint8_t*>(der_ptr),
-                                    static_cast<const uint8_t*>(der_ptr) + der_len);
+            req.request_der.assign(
+                static_cast<uint8_t const*>(der_ptr),
+                static_cast<uint8_t const*>(der_ptr) + der_len);
         }
         req.timeout_ms = timeout_ms;
         batch_req.requests.push_back(std::move(req));
 
-        r = sd_bus_message_exit_container(m); // закрывает STRUCT этого элемента
-        if (r < 0) return r;
+        r = sd_bus_message_exit_container(
+            m);  // закрывает STRUCT этого элемента
+        if (r < 0) {
+            return r;
+        }
     }
-    r = sd_bus_message_exit_container(m); // закрывает ARRAY
-    if (r < 0) return r;
+    r = sd_bus_message_exit_container(m);  // закрывает ARRAY
+    if (r < 0) {
+        return r;
+    }
 
     sd_bus_message* call = sd_bus_message_ref(m);
     sd_bus* bus = sd_bus_message_get_bus(m);
 
-    self->enqueue([self, bus, call, batch_req = std::move(batch_req)]() mutable {
-        auto batch_resp = self->router.handle_ocsp_batch(batch_req);
+    self->enqueue([self, bus, call,
+                   batch_req = std::move(batch_req)]() mutable {
+        try {
+            auto batch_resp = self->router.handle_ocsp_batch(batch_req);
 
-        sd_bus_message* reply = nullptr;
-        int rr = sd_bus_message_new_method_return(call, &reply);
-        if (rr >= 0) rr = sd_bus_message_open_container(reply, SD_BUS_TYPE_ARRAY, "(yayb)");
-        if (rr >= 0) {
-            for (const auto& resp : batch_resp.responses) {
-                rr = sd_bus_message_open_container(reply, SD_BUS_TYPE_STRUCT, "yayb");
-                if (rr < 0) break;
-                rr = sd_bus_message_append(reply, "y", static_cast<uint8_t>(resp.status));
-                if (rr >= 0) {
-                    const void* data = resp.payload_der.empty() ? nullptr : resp.payload_der.data();
-                    rr = sd_bus_message_append_array(reply, 'y', data, resp.payload_der.size());
-                }
-                if (rr >= 0) rr = sd_bus_message_append(reply, "b", resp.from_cache ? 1 : 0);
-                if (rr >= 0) rr = sd_bus_message_close_container(reply); // закрывает этот STRUCT
-                if (rr < 0) break;
+            sd_bus_message* reply = nullptr;
+            int rr = sd_bus_message_new_method_return(call, &reply);
+            if (rr >= 0) {
+                rr = sd_bus_message_open_container(reply, SD_BUS_TYPE_ARRAY,
+                                                   "(yayb)");
             }
+            if (rr >= 0) {
+                for (auto const& resp : batch_resp.responses) {
+                    rr = sd_bus_message_open_container(
+                        reply, SD_BUS_TYPE_STRUCT, "yayb");
+                    if (rr < 0) {
+                        break;
+                    }
+                    rr = sd_bus_message_append(
+                        reply, "y", static_cast<uint8_t>(resp.status));
+                    if (rr >= 0) {
+                        void const* data = resp.payload_der.empty()
+                                               ? nullptr
+                                               : resp.payload_der.data();
+                        rr = sd_bus_message_append_array(
+                            reply, 'y', data, resp.payload_der.size());
+                    }
+                    if (rr >= 0) {
+                        rr = sd_bus_message_append(reply, "b",
+                                                   resp.from_cache ? 1 : 0);
+                    }
+                    if (rr >= 0) {
+                        rr = sd_bus_message_close_container(
+                            reply);  // закрывает этот STRUCT
+                    }
+                    if (rr < 0) {
+                        break;
+                    }
+                }
+            }
+            if (rr >= 0) {
+                rr = sd_bus_message_close_container(reply);  // закрывает ARRAY
+            }
+            if (rr >= 0) {
+                sd_bus_send(bus, reply, nullptr);
+            }
+            if (reply != nullptr) {
+                sd_bus_message_unref(reply);
+            }
+            sd_bus_message_unref(call);
+        } catch (...) {
+            send_internal_error_reply(bus, call, std::current_exception());
         }
-        if (rr >= 0) rr = sd_bus_message_close_container(reply); // закрывает ARRAY
-        if (rr >= 0) sd_bus_send(bus, reply, nullptr);
-        if (reply != nullptr) sd_bus_message_unref(reply);
-        sd_bus_message_unref(call);
     });
     return 1;
 }
 
-int DbusServer::on_fetch_crl(sd_bus_message* m, void* userdata, sd_bus_error* /*ret_error*/) {
+int DbusServer::on_fetch_crl(sd_bus_message* m, void* userdata,
+                             sd_bus_error* /*ret_error*/) {
     auto* self = static_cast<DbusServer*>(userdata);
 
-    const char* url = nullptr;
+    char const* url = nullptr;
     uint32_t timeout_ms = 0;
     int r = sd_bus_message_read(m, "s", &url);
-    if (r < 0) return r;
+    if (r < 0) {
+        return r;
+    }
     r = sd_bus_message_read(m, "u", &timeout_ms);
-    if (r < 0) return r;
+    if (r < 0) {
+        return r;
+    }
 
     proto::FetchCrlRequest req;
     req.distribution_point_url = url;
@@ -347,22 +499,30 @@ int DbusServer::on_fetch_crl(sd_bus_message* m, void* userdata, sd_bus_error* /*
     sd_bus* bus = sd_bus_message_get_bus(m);
 
     self->enqueue([self, bus, call, req = std::move(req)]() mutable {
-        auto resp = self->router.handle_crl(req);
-        send_fetch_reply(bus, call, resp);
+        try {
+            auto resp = self->router.handle_crl(req);
+            send_fetch_reply(bus, call, resp);
+        } catch (...) {
+            send_internal_error_reply(bus, call, std::current_exception());
+        }
     });
     return 1;
 }
 
 int DbusServer::on_fetch_intermediate_cert(sd_bus_message* m, void* userdata,
-                                            sd_bus_error* /*ret_error*/) {
+                                           sd_bus_error* /*ret_error*/) {
     auto* self = static_cast<DbusServer*>(userdata);
 
-    const char* url = nullptr;
+    char const* url = nullptr;
     uint32_t timeout_ms = 0;
     int r = sd_bus_message_read(m, "s", &url);
-    if (r < 0) return r;
+    if (r < 0) {
+        return r;
+    }
     r = sd_bus_message_read(m, "u", &timeout_ms);
-    if (r < 0) return r;
+    if (r < 0) {
+        return r;
+    }
 
     proto::FetchIntermediateCertRequest req;
     req.aia_url = url;
@@ -372,13 +532,18 @@ int DbusServer::on_fetch_intermediate_cert(sd_bus_message* m, void* userdata,
     sd_bus* bus = sd_bus_message_get_bus(m);
 
     self->enqueue([self, bus, call, req = std::move(req)]() mutable {
-        auto resp = self->router.handle_intermediate_cert(req);
-        send_fetch_reply(bus, call, resp);
+        try {
+            auto resp = self->router.handle_intermediate_cert(req);
+            send_fetch_reply(bus, call, resp);
+        } catch (...) {
+            send_internal_error_reply(bus, call, std::current_exception());
+        }
     });
     return 1;
 }
 
-int DbusServer::on_health_check(sd_bus_message* m, void* userdata, sd_bus_error* /*ret_error*/) {
+int DbusServer::on_health_check(sd_bus_message* m, void* userdata,
+                                sd_bus_error* /*ret_error*/) {
     auto* self = static_cast<DbusServer*>(userdata);
 
     // Health-check не делает сети и не бьёт в кэш дольше, чем на разовое
@@ -388,23 +553,56 @@ int DbusServer::on_health_check(sd_bus_message* m, void* userdata, sd_bus_error*
 
     sd_bus_message* reply = nullptr;
     int r = sd_bus_message_new_method_return(m, &reply);
-    if (r >= 0) r = sd_bus_message_append(reply, "b", resp.healthy ? 1 : 0);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.cache_entries);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.cache_size_bytes);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.memory_cache_entries);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.memory_cache_size_bytes);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.ocsp.requests);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.ocsp.cache_hits);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.ocsp.errors);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.crl.requests);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.crl.cache_hits);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.crl.errors);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.intermediate_cert.requests);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.intermediate_cert.cache_hits);
-    if (r >= 0) r = sd_bus_message_append(reply, "t", resp.intermediate_cert.errors);
-    if (r >= 0) r = sd_bus_send(sd_bus_message_get_bus(m), reply, nullptr);
-    if (reply != nullptr) sd_bus_message_unref(reply);
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "b", resp.healthy ? 1 : 0);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.cache_entries);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.cache_size_bytes);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.memory_cache_entries);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.memory_cache_size_bytes);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.ocsp.requests);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.ocsp.cache_hits);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.ocsp.errors);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.crl.requests);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.crl.cache_hits);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.crl.errors);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.intermediate_cert.requests);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t",
+                                  resp.intermediate_cert.cache_hits);
+    }
+    if (r >= 0) {
+        r = sd_bus_message_append(reply, "t", resp.intermediate_cert.errors);
+    }
+    if (r >= 0) {
+        r = sd_bus_send(sd_bus_message_get_bus(m), reply, nullptr);
+    }
+    if (reply != nullptr) {
+        sd_bus_message_unref(reply);
+    }
     return 1;
 }
 
-} // namespace cert_helper::ipc
+}  // namespace cert_helper::ipc

@@ -25,7 +25,8 @@
 //   config.revocation_fetchers = fetchers;
 //
 //   // После доработки tls-mitm из раздела 7 ТЗ (часть 2):
-//   // config.certificate_fetchers.intermediate_cert = helper_client.intermediate_cert_fetcher();
+//   // config.certificate_fetchers.intermediate_cert =
+//   helper_client.intermediate_cert_fetcher();
 //
 // Все три fetcher'а — блокирующие вызовы (синхронный sd_bus_call внутри
 // DbusClient) и следуют контракту "пустой вектор = ошибка/таймаут", уже
@@ -49,37 +50,38 @@ namespace cert_helper {
 // напрямую в соответствующее поле RevocationFetchers/CertificateFetchers
 // без дополнительных адаптеров.
 using OcspFetcherFn = std::function<std::vector<uint8_t>(
-    const std::string& responder_url, const std::vector<uint8_t>& request_der,
+    std::string const& responder_url, std::vector<uint8_t> const& request_der,
     uint32_t timeout_ms)>;
 
 using CrlFetcherFn = std::function<std::vector<uint8_t>(
-    const std::string& distribution_point_url, uint32_t timeout_ms)>;
+    std::string const& distribution_point_url, uint32_t timeout_ms)>;
 
 using IntermediateCertFetcherFn = std::function<std::vector<uint8_t>(
-    const std::string& aia_url, uint32_t timeout_ms)>;
+    std::string const& aia_url, uint32_t timeout_ms)>;
 
 class Client {
 public:
     // bus_address пустой (по умолчанию) => системная шина D-Bus, как и
     // положено для системного демона вроде cert-helper. Непустой адрес —
     // для тестов/нестандартных окружений (приватная шина).
-    explicit Client(std::string bus_address = {}) : impl(std::move(bus_address)) {}
+    explicit Client(std::string bus_address = {})
+        : impl(std::move(bus_address)) {}
 
-    std::vector<uint8_t> fetch_ocsp(const std::string& responder_url,
-                                     const std::vector<uint8_t>& request_der,
-                                     uint32_t timeout_ms) {
+    std::vector<uint8_t> fetch_ocsp(std::string const& responder_url,
+                                    std::vector<uint8_t> const& request_der,
+                                    uint32_t timeout_ms) {
         auto resp = impl.fetch_ocsp(responder_url, request_der, timeout_ms);
         return unwrap(resp);
     }
 
-    std::vector<uint8_t> fetch_crl(const std::string& distribution_point_url,
-                                    uint32_t timeout_ms) {
+    std::vector<uint8_t> fetch_crl(std::string const& distribution_point_url,
+                                   uint32_t timeout_ms) {
         auto resp = impl.fetch_crl(distribution_point_url, timeout_ms);
         return unwrap(resp);
     }
 
-    std::vector<uint8_t> fetch_intermediate_cert(const std::string& aia_url,
-                                                  uint32_t timeout_ms) {
+    std::vector<uint8_t> fetch_intermediate_cert(std::string const& aia_url,
+                                                 uint32_t timeout_ms) {
         auto resp = impl.fetch_intermediate_cert(aia_url, timeout_ms);
         return unwrap(resp);
     }
@@ -120,19 +122,20 @@ public:
     // Готовые std::function для прямого присваивания в
     // tls_mitm::RevocationFetchers / будущую tls_mitm::CertificateFetchers.
     OcspFetcherFn ocsp_fetcher() {
-        return [this](const std::string& url, const std::vector<uint8_t>& der, uint32_t timeout_ms) {
+        return [this](std::string const& url, std::vector<uint8_t> const& der,
+                      uint32_t timeout_ms) {
             return this->fetch_ocsp(url, der, timeout_ms);
         };
     }
 
     CrlFetcherFn crl_fetcher() {
-        return [this](const std::string& url, uint32_t timeout_ms) {
+        return [this](std::string const& url, uint32_t timeout_ms) {
             return this->fetch_crl(url, timeout_ms);
         };
     }
 
     IntermediateCertFetcherFn intermediate_cert_fetcher() {
-        return [this](const std::string& url, uint32_t timeout_ms) {
+        return [this](std::string const& url, uint32_t timeout_ms) {
             return this->fetch_intermediate_cert(url, timeout_ms);
         };
     }
@@ -143,12 +146,14 @@ private:
     // недоступна, вызов оборван по таймауту) или сбой сетевого запроса,
     // который сделал сам демон (FetchStatus != Ok). Вызывающая библиотека
     // не обязана различать эти случаи.
-    static std::vector<uint8_t> unwrap(const protocol::FetchResponse& resp) {
-        if (resp.status != protocol::FetchStatus::Ok) return {};
+    static std::vector<uint8_t> unwrap(protocol::FetchResponse const& resp) {
+        if (resp.status != protocol::FetchStatus::OK) {
+            return {};
+        }
         return resp.payload_der;
     }
 
     client_impl::DbusClient impl;
 };
 
-} // namespace cert_helper
+}  // namespace cert_helper

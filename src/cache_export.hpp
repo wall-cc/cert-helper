@@ -71,7 +71,7 @@ namespace fs = std::filesystem;
 
 namespace detail {
 
-constexpr char kMagic[8] = {'C', 'H', 'C', 'A', 'C', 'H', 'E', '1'};
+constexpr char MAGIC[8] = {'C', 'H', 'C', 'A', 'C', 'H', 'E', '1'};
 
 inline void write_le(std::ofstream& out, uint64_t v, int bytes) {
     for (int i = 0; i < bytes; ++i) {
@@ -85,14 +85,17 @@ inline bool read_le(std::ifstream& in, uint64_t& v, int bytes) {
     for (int i = 0; i < bytes; ++i) {
         char b = 0;
         in.read(&b, 1);
-        if (in.gcount() != 1) return false;
+        if (in.gcount() != 1) {
+            return false;
+        }
         v |= static_cast<uint64_t>(static_cast<unsigned char>(b)) << (8 * i);
     }
     return true;
 }
 
 inline int64_t now_seconds() {
-    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 
@@ -107,30 +110,40 @@ struct RawEntry {
     std::vector<uint8_t> payload;
 };
 
-inline std::optional<RawEntry> read_raw_entry_file(const fs::path& path) {
+inline std::optional<RawEntry> read_raw_entry_file(fs::path const& path) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
+    if (!in) {
+        return std::nullopt;
+    }
     uint64_t fetched_at = 0, valid_until = 0;
-    if (!read_le(in, fetched_at, 8)) return std::nullopt;
-    if (!read_le(in, valid_until, 8)) return std::nullopt;
+    if (!read_le(in, fetched_at, 8)) {
+        return std::nullopt;
+    }
+    if (!read_le(in, valid_until, 8)) {
+        return std::nullopt;
+    }
     RawEntry entry;
     entry.fetched_at = static_cast<int64_t>(fetched_at);
     entry.valid_until = static_cast<int64_t>(valid_until);
-    entry.payload.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    entry.payload.assign(std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>());
     return entry;
 }
 
-inline bool write_raw_entry_file(const fs::path& final_path, const RawEntry& entry) {
+inline bool write_raw_entry_file(fs::path const& final_path,
+                                 RawEntry const& entry) {
     fs::path tmp_path = final_path;
     tmp_path += ".import_tmp";
     {
         std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
+        if (!out) {
+            return false;
+        }
         write_le(out, static_cast<uint64_t>(entry.fetched_at), 8);
         write_le(out, static_cast<uint64_t>(entry.valid_until), 8);
         if (!entry.payload.empty()) {
-            out.write(reinterpret_cast<const char*>(entry.payload.data()),
-                       static_cast<std::streamsize>(entry.payload.size()));
+            out.write(reinterpret_cast<char const*>(entry.payload.data()),
+                      static_cast<std::streamsize>(entry.payload.size()));
         }
     }
     // rename() атомарен на одной ФС — та же гарантия, что и у самого
@@ -142,7 +155,7 @@ inline bool write_raw_entry_file(const fs::path& final_path, const RawEntry& ent
     return !ec;
 }
 
-} // namespace detail
+}  // namespace detail
 
 struct ExportStats {
     uint64_t exported = 0;
@@ -155,19 +168,26 @@ struct ExportStats {
 // Возвращает nullopt, если output_path не удалось открыть на запись —
 // в остальном (отдельные битые/просроченные файлы кэша) — best-effort,
 // не прерывает весь экспорт.
-inline std::optional<ExportStats> run_export(const std::string& cache_dir, const std::string& output_path) {
+inline std::optional<ExportStats> run_export(std::string const& cache_dir,
+                                             std::string const& output_path) {
     std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
-    if (!out) return std::nullopt;
+    if (!out) {
+        return std::nullopt;
+    }
 
     ExportStats stats;
     std::vector<std::pair<std::string, detail::RawEntry>> entries;
 
     std::error_code ec;
     int64_t now = detail::now_seconds();
-    for (const auto& de : fs::directory_iterator(cache_dir, ec)) {
-        if (!de.is_regular_file()) continue;
+    for (auto const& de : fs::directory_iterator(cache_dir, ec)) {
+        if (!de.is_regular_file()) {
+            continue;
+        }
         std::string name = de.path().filename().string();
-        if (name.size() < 5 || name.substr(name.size() - 4) != ".bin") continue;
+        if (name.size() < 5 || name.substr(name.size() - 4) != ".bin") {
+            continue;
+        }
 
         auto entry = detail::read_raw_entry_file(de.path());
         if (!entry) {
@@ -175,23 +195,24 @@ inline std::optional<ExportStats> run_export(const std::string& cache_dir, const
             continue;
         }
         if (entry->valid_until != 0 && now >= entry->valid_until) {
-            ++stats.skipped_expired; // не тащим заведомо мёртвый балласт на другой хост
+            ++stats.skipped_expired;  // не тащим заведомо мёртвый балласт на
+                                      // другой хост
             continue;
         }
         entries.emplace_back(name, std::move(*entry));
     }
 
-    out.write(detail::kMagic, sizeof(detail::kMagic));
+    out.write(detail::MAGIC, sizeof(detail::MAGIC));
     detail::write_le(out, entries.size(), 4);
-    for (const auto& [name, entry] : entries) {
+    for (auto const& [name, entry] : entries) {
         detail::write_le(out, name.size(), 2);
         out.write(name.data(), static_cast<std::streamsize>(name.size()));
         detail::write_le(out, static_cast<uint64_t>(entry.fetched_at), 8);
         detail::write_le(out, static_cast<uint64_t>(entry.valid_until), 8);
         detail::write_le(out, entry.payload.size(), 4);
         if (!entry.payload.empty()) {
-            out.write(reinterpret_cast<const char*>(entry.payload.data()),
-                       static_cast<std::streamsize>(entry.payload.size()));
+            out.write(reinterpret_cast<char const*>(entry.payload.data()),
+                      static_cast<std::streamsize>(entry.payload.size()));
         }
         ++stats.exported;
     }
@@ -214,18 +235,24 @@ struct ImportStats {
 // FileCacheStore, не самого экспорта/импорта; на практике импорт
 // делается перед стартом/рестартом демона на новом хосте, что этого
 // ограничения не касается.
-inline std::optional<ImportStats> run_import(const std::string& cache_dir, const std::string& input_path) {
+inline std::optional<ImportStats> run_import(std::string const& cache_dir,
+                                             std::string const& input_path) {
     std::ifstream in(input_path, std::ios::binary);
-    if (!in) return std::nullopt;
+    if (!in) {
+        return std::nullopt;
+    }
 
     char magic[8];
     in.read(magic, sizeof(magic));
-    if (in.gcount() != sizeof(magic) || std::memcmp(magic, detail::kMagic, sizeof(magic)) != 0) {
-        return std::nullopt; // не наш формат — не пытаемся угадать/чинить
+    if (in.gcount() != sizeof(magic) ||
+        std::memcmp(magic, detail::MAGIC, sizeof(magic)) != 0) {
+        return std::nullopt;  // не наш формат — не пытаемся угадать/чинить
     }
 
     uint64_t count = 0;
-    if (!detail::read_le(in, count, 4)) return std::nullopt;
+    if (!detail::read_le(in, count, 4)) {
+        return std::nullopt;
+    }
 
     fs::create_directories(cache_dir);
     ImportStats stats;
@@ -233,21 +260,32 @@ inline std::optional<ImportStats> run_import(const std::string& cache_dir, const
 
     for (uint64_t i = 0; i < count; ++i) {
         uint64_t name_len = 0;
-        if (!detail::read_le(in, name_len, 2)) { ++stats.skipped_malformed; break; }
+        if (!detail::read_le(in, name_len, 2)) {
+            ++stats.skipped_malformed;
+            break;
+        }
         std::string name(name_len, '\0');
         in.read(name.data(), static_cast<std::streamsize>(name_len));
-        if (static_cast<uint64_t>(in.gcount()) != name_len) { ++stats.skipped_malformed; break; }
+        if (static_cast<uint64_t>(in.gcount()) != name_len) {
+            ++stats.skipped_malformed;
+            break;
+        }
 
         uint64_t fetched_at = 0, valid_until = 0, payload_len = 0;
-        if (!detail::read_le(in, fetched_at, 8) || !detail::read_le(in, valid_until, 8) ||
+        if (!detail::read_le(in, fetched_at, 8) ||
+            !detail::read_le(in, valid_until, 8) ||
             !detail::read_le(in, payload_len, 4)) {
             ++stats.skipped_malformed;
             break;
         }
         std::vector<uint8_t> payload(payload_len);
         if (payload_len > 0) {
-            in.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payload_len));
-            if (static_cast<uint64_t>(in.gcount()) != payload_len) { ++stats.skipped_malformed; break; }
+            in.read(reinterpret_cast<char*>(payload.data()),
+                    static_cast<std::streamsize>(payload_len));
+            if (static_cast<uint64_t>(in.gcount()) != payload_len) {
+                ++stats.skipped_malformed;
+                break;
+            }
         }
 
         int64_t valid_until_signed = static_cast<int64_t>(valid_until);
@@ -274,4 +312,4 @@ inline std::optional<ImportStats> run_import(const std::string& cache_dir, const
     return stats;
 }
 
-} // namespace cert_helper::cache_export
+}  // namespace cert_helper::cache_export

@@ -10,15 +10,15 @@
 // по умолчанию (см. test_net_policy.cpp), здесь мы намеренно ослабляем
 // политику, чтобы протестировать сам HTTP-клиент в изоляции от неё.
 
-#include <chrono>
-#include <cstring>
-#include <string>
-#include <thread>
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <thread>
 
 #include "../src/http_client.hpp"
 #include "../src/net_policy.hpp"
@@ -34,19 +34,22 @@ namespace {
 // соединение в отдельном потоке, затем закрывается.
 class OneShotHttpServer {
 public:
-    explicit OneShotHttpServer(std::string response_text) : response(std::move(response_text)) {
+    explicit OneShotHttpServer(std::string response_text)
+        : response(std::move(response_text)) {
         listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         int opt = 1;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-        struct sockaddr_in addr{};
+        struct sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0; // пусть ОС выберет свободный порт
-        bind(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+        addr.sin_port = 0;  // пусть ОС выберет свободный порт
+        bind(listen_fd, reinterpret_cast<struct sockaddr*>(&addr),
+             sizeof(addr));
 
         socklen_t addr_len = sizeof(addr);
-        getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), &addr_len);
+        getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&addr),
+                    &addr_len);
         listening_port = ntohs(addr.sin_port);
 
         listen(listen_fd, 1);
@@ -61,13 +64,18 @@ public:
             fd_set read_fds;
             FD_ZERO(&read_fds);
             FD_SET(listen_fd, &read_fds);
-            struct timeval tv{};
+            struct timeval tv {};
             tv.tv_sec = 1;
             int sel = select(listen_fd + 1, &read_fds, nullptr, nullptr, &tv);
-            if (sel <= 0) return; // таймаут — никто не подключился, это ожидаемо в некоторых тестах
+            if (sel <= 0) {
+                return;  // таймаут — никто не подключился, это ожидаемо в
+                         // некоторых тестах
+            }
 
             int client_fd = accept(listen_fd, nullptr, nullptr);
-            if (client_fd < 0) return;
+            if (client_fd < 0) {
+                return;
+            }
             // Не парсим запрос — тесту важен только ответ; просто вычитываем
             // что пришло (достаточно для корректного TCP-обмена) и отвечаем.
             char buf[4096];
@@ -78,7 +86,9 @@ public:
     }
 
     ~OneShotHttpServer() {
-        if (server_thread.joinable()) server_thread.join();
+        if (server_thread.joinable()) {
+            server_thread.join();
+        }
         ::close(listen_fd);
     }
 
@@ -93,7 +103,8 @@ private:
 
 NetworkPolicy make_permissive_policy(uint16_t port) {
     NetworkPolicy::Config cfg;
-    cfg.block_private_by_default = false; // разрешаем loopback только для этого теста
+    cfg.block_private_by_default =
+        false;  // разрешаем loopback только для этого теста
     cfg.allowed_ports = {port};
     return NetworkPolicy(cfg);
 }
@@ -108,8 +119,9 @@ void test_max_age_is_parsed() {
         "HELLO");
 
     SimpleHttpFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
-    auto result = fetcher.fetch(Method::Get, url, {}, "", 2000, 1024 * 1024);
+    std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
+    auto result = fetcher.fetch(Method::GET, url, {}, "", 2000, 1024 * 1024);
 
     TEST_CHECK(result.ok);
     TEST_CHECK(result.body == std::vector<uint8_t>({'H', 'E', 'L', 'L', 'O'}));
@@ -128,8 +140,9 @@ void test_no_store_is_parsed() {
         "OK");
 
     SimpleHttpFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
-    auto result = fetcher.fetch(Method::Get, url, {}, "", 2000, 1024 * 1024);
+    std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
+    auto result = fetcher.fetch(Method::GET, url, {}, "", 2000, 1024 * 1024);
 
     TEST_CHECK(result.ok);
     TEST_CHECK(result.cache_hints.no_store);
@@ -144,8 +157,9 @@ void test_no_cache_is_parsed() {
         "OK");
 
     SimpleHttpFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
-    auto result = fetcher.fetch(Method::Get, url, {}, "", 2000, 1024 * 1024);
+    std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
+    auto result = fetcher.fetch(Method::GET, url, {}, "", 2000, 1024 * 1024);
 
     TEST_CHECK(result.ok);
     TEST_CHECK(result.cache_hints.no_cache);
@@ -163,8 +177,9 @@ void test_expires_header_is_parsed() {
         "OK");
 
     SimpleHttpFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
-    auto result = fetcher.fetch(Method::Get, url, {}, "", 2000, 1024 * 1024);
+    std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
+    auto result = fetcher.fetch(Method::GET, url, {}, "", 2000, 1024 * 1024);
 
     TEST_CHECK(result.ok);
     TEST_CHECK(result.cache_hints.expires_unix.has_value());
@@ -179,8 +194,9 @@ void test_no_cache_headers_leaves_hints_empty() {
         "OK");
 
     SimpleHttpFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
-    auto result = fetcher.fetch(Method::Get, url, {}, "", 2000, 1024 * 1024);
+    std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
+    auto result = fetcher.fetch(Method::GET, url, {}, "", 2000, 1024 * 1024);
 
     TEST_CHECK(result.ok);
     TEST_CHECK(!result.cache_hints.no_store);
@@ -189,7 +205,14 @@ void test_no_cache_headers_leaves_hints_empty() {
     TEST_CHECK(!result.cache_hints.expires_unix.has_value());
 }
 
-void test_default_policy_blocks_loopback_even_for_this_fetcher() {    // Регрессия на пункт 3: без явного ослабления политики (как во всех
+void test_default_policy_blocks_loopback_even_for_this_fetcher() {  // Регрессия
+                                                                    // на пункт
+                                                                    // 3: без
+                                                                    // явного
+                                                                    // ослабления
+                                                                    // политики
+                                                                    // (как во
+                                                                    // всех
     // остальных тестах этого файла через make_permissive_policy())
     // SimpleHttpFetcher не должен суметь достучаться до loopback вовсе —
     // проверяем именно адресную блокировку (не порт), поэтому явно
@@ -201,12 +224,14 @@ void test_default_policy_blocks_loopback_even_for_this_fetcher() {    // Рег�
         "\r\n"
         "OK");
 
-    NetworkPolicy::Config cfg; // block_private_by_default остаётся true (default)
+    NetworkPolicy::Config
+        cfg;  // block_private_by_default остаётся true (default)
     cfg.allowed_ports = {server.port()};
     NetworkPolicy policy(cfg);
     SimpleHttpFetcher fetcher(policy);
-    std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
-    auto result = fetcher.fetch(Method::Get, url, {}, "", 500, 1024 * 1024);
+    std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
+    auto result = fetcher.fetch(Method::GET, url, {}, "", 500, 1024 * 1024);
 
     TEST_CHECK(!result.ok);
 }
@@ -226,18 +251,21 @@ void test_dns_cache_does_not_bypass_policy_on_repeated_use() {
         "\r\n"
         "OK");
 
-    NetworkPolicy::Config cfg; // block_private_by_default остаётся true (default)
+    NetworkPolicy::Config
+        cfg;  // block_private_by_default остаётся true (default)
     cfg.allowed_ports = {server.port()};
     NetworkPolicy policy(cfg);
     SimpleHttpFetcher fetcher(policy);
-    std::string url = "http://localhost:" + std::to_string(server.port()) + "/x";
+    std::string url =
+        "http://localhost:" + std::to_string(server.port()) + "/x";
 
-    auto result1 = fetcher.fetch(Method::Get, url, {}, "", 500, 1024 * 1024);
-    TEST_CHECK(!result1.ok); // первый вызов — DNS ещё не закэширован, но политика уже блокирует
+    auto result1 = fetcher.fetch(Method::GET, url, {}, "", 500, 1024 * 1024);
+    TEST_CHECK(!result1.ok);  // первый вызов — DNS ещё не закэширован, но
+                              // политика уже блокирует
 
     // "localhost" теперь в DNS-кэше (резолвится в 127.0.0.1) — если бы
     // кэш давал возможность обойти политику, второй вызов прошёл бы.
-    auto result2 = fetcher.fetch(Method::Get, url, {}, "", 500, 1024 * 1024);
+    auto result2 = fetcher.fetch(Method::GET, url, {}, "", 500, 1024 * 1024);
     TEST_CHECK(!result2.ok);
 }
 
@@ -257,8 +285,10 @@ void test_response_exceeding_max_bytes_is_rejected() {
         body);
 
     SimpleHttpFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
-    auto result = fetcher.fetch(Method::Get, url, {}, "", 2000, /*max_response_bytes=*/500);
+    std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
+    auto result = fetcher.fetch(Method::GET, url, {}, "", 2000,
+                                /*max_response_bytes=*/500);
 
     TEST_CHECK(!result.ok);
 }
@@ -272,14 +302,16 @@ void test_response_within_max_bytes_is_accepted() {
         body);
 
     SimpleHttpFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
-    auto result = fetcher.fetch(Method::Get, url, {}, "", 2000, /*max_response_bytes=*/500);
+    std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/x";
+    auto result = fetcher.fetch(Method::GET, url, {}, "", 2000,
+                                /*max_response_bytes=*/500);
 
     TEST_CHECK(result.ok);
     TEST_CHECK_EQ(result.body.size(), size_t{400});
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     RUN_TEST(test_max_age_is_parsed);

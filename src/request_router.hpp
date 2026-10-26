@@ -12,7 +12,7 @@
 // демона докачки сертификатов в Squid):
 //   - OCSP: TTL = nextUpdate из самого OCSP-ответа (если поле присутствует;
 //     если nextUpdate отсутствует в ответе — используем короткий дефолтный
-//     TTL, см. kDefaultOcspTtlSeconds, т.к. RFC 6960 не требует nextUpdate).
+//     TTL, см. DEFAULT_OCSP_TTL_SECONDS, т.к. RFC 6960 не требует nextUpdate).
 //     Дополнительно клампится сверху max_ocsp_ttl_seconds (ROADMAP.md,
 //     раздел 1, пункт 2) — недобросовестный/скомпрометированный responder
 //     не может продлить себе кэш дольше этого предела, указав заведомо
@@ -159,6 +159,13 @@
 
 #pragma once
 
+#include <openssl/bn.h>
+#include <openssl/objects.h>
+#include <openssl/ocsp.h>
+#include <openssl/pkcs7.h>
+#include <openssl/sha.h>
+#include <openssl/x509.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -172,19 +179,12 @@
 #include <thread>
 #include <unordered_map>
 
-#include <openssl/bn.h>
-#include <openssl/objects.h>
-#include <openssl/ocsp.h>
-#include <openssl/pkcs7.h>
-#include <openssl/sha.h>
-#include <openssl/x509.h>
-
+#include "../include/cert_helper/protocol.hpp"
 #include "aia.hpp"
 #include "audit_log.hpp"
 #include "cache/cache_store.hpp"
 #include "http_client.hpp"
 #include "ldap_client.hpp"
-#include "../include/cert_helper/protocol.hpp"
 
 namespace cert_helper {
 
@@ -193,17 +193,19 @@ namespace proto = cert_helper::protocol;
 class RequestRouter {
 public:
     struct Config {
-        uint32_t default_ocsp_ttl_seconds = 300;       // если nextUpdate отсутствует
-        uint32_t default_crl_ttl_seconds = 3600;        // если nextUpdate не удалось разобрать
-        uint32_t aia_ttl_seconds = 7 * 24 * 3600;        // согласовано с tls-mitm config.hpp
+        uint32_t default_ocsp_ttl_seconds = 300;  // если nextUpdate отсутствует
+        uint32_t default_crl_ttl_seconds =
+            3600;  // если nextUpdate не удалось разобрать
+        uint32_t aia_ttl_seconds =
+            7 * 24 * 3600;  // согласовано с tls-mitm config.hpp
         // ROADMAP.md, раздел 1, пункт 2 (P0): верхняя граница TTL для
         // OCSP/CRL, не зависящая от того, что заявил responder/CA в
         // nextUpdate. Без неё недобросовестный/скомпрометированный
         // responder может указать nextUpdate через год, и демон год будет
         // отдавать устаревший статус отзыва (cache poisoning с очень
         // долгим действием) — см. clamp_ocsp_ttl()/clamp_crl_ttl() ниже.
-        uint32_t max_ocsp_ttl_seconds = 24 * 3600;       // 24 часа
-        uint32_t max_crl_ttl_seconds = 7 * 24 * 3600;    // 7 дней
+        uint32_t max_ocsp_ttl_seconds = 24 * 3600;     // 24 часа
+        uint32_t max_crl_ttl_seconds = 7 * 24 * 3600;  // 7 дней
 
         // ROADMAP.md, раздел 1, пункт 4 (P1): лимиты размера ответа по
         // типу запроса, а не одна константа на всё. OCSP-ответ и
@@ -212,9 +214,9 @@ public:
         // поверхность для исчерпания памяти/диска ответом от
         // недобросовестного/скомпрометированного сервера. CRL, наоборот,
         // легитимно может быть большим (крупные CA — единицы-десятки МБ).
-        uint32_t max_ocsp_response_bytes = 256 * 1024;        // 256 КиБ
-        uint32_t max_aia_response_bytes = 256 * 1024;         // 256 КиБ
-        uint32_t max_crl_response_bytes = 16 * 1024 * 1024;   // 16 МиБ
+        uint32_t max_ocsp_response_bytes = 256 * 1024;       // 256 КиБ
+        uint32_t max_aia_response_bytes = 256 * 1024;        // 256 КиБ
+        uint32_t max_crl_response_bytes = 16 * 1024 * 1024;  // 16 МиБ
 
         // ROADMAP.md, раздел 2, пункт 10 (P1): retry с backoff для
         // транзиентных сетевых ошибок (одиночный дропнутый пакет/RST и
@@ -229,27 +231,38 @@ public:
 
         // ROADMAP.md, раздел 2, пункт 11 (P1): circuit breaker per-host —
         // см. подробный комментарий в начале файла.
-        uint32_t circuit_breaker_failure_threshold = 5;   // подряд неудачных ЗАПРОСОВ до открытия
-        uint32_t circuit_breaker_cooldown_seconds = 30;   // время в открытом состоянии
-        uint32_t circuit_breaker_max_tracked_hosts = 10000; // защита от неограниченного роста карты
+        uint32_t circuit_breaker_failure_threshold =
+            5;  // подряд неудачных ЗАПРОСОВ до открытия
+        uint32_t circuit_breaker_cooldown_seconds =
+            30;  // время в открытом состоянии
+        uint32_t circuit_breaker_max_tracked_hosts =
+            10000;  // защита от неограниченного роста карты
     };
 
     // audit_sink — ROADMAP.md, раздел 4, пункт 23: приёмник аудит-событий
     // (см. audit_log.hpp); nullptr (по умолчанию) — аудит выключен.
     // Не владеющий указатель, время жизни — на вызывающем.
-    RequestRouter(cache::ICacheStore& cache_store, http::IHttpFetcher& http_fetcher, Config config,
-                  ldap::ILdapFetcher* ldap_fetcher = nullptr, audit::IAuditSink* audit_sink = nullptr)
-        : cache_store(cache_store), http_fetcher(http_fetcher), config(config), ldap_fetcher(ldap_fetcher),
-          audit_sink_(audit_sink) {}
+    RequestRouter(cache::ICacheStore& cache_store,
+                  http::IHttpFetcher& http_fetcher, Config config,
+                  ldap::ILdapFetcher* ldap_fetcher = nullptr,
+                  audit::IAuditSink* audit_sink = nullptr)
+        : cache_store(cache_store),
+          http_fetcher(http_fetcher),
+          config(config),
+          ldap_fetcher(ldap_fetcher),
+          audit_sink(audit_sink) {}
 
-    proto::FetchResponse handle_ocsp(const proto::FetchOcspRequest& req) {
-        std::string key = "ocsp|" + req.responder_url + "|" + ocsp_request_cache_fingerprint(req.request_der);
-        const auto started = std::chrono::steady_clock::now();
+    proto::FetchResponse handle_ocsp(proto::FetchOcspRequest const& req) {
+        std::string key = "ocsp|" + req.responder_url + "|" +
+                          ocsp_request_cache_fingerprint(req.request_der);
+        auto const started = std::chrono::steady_clock::now();
         AuditDetail detail;
-        proto::FetchResponse resp =
-            singleflight_execute(key, [this, &req, &detail] { return handle_ocsp_impl(req, detail); });
+        proto::FetchResponse resp = singleflight_execute(
+            key,
+            [this, &req, &detail] { return handle_ocsp_impl(req, detail); });
         record_stats(ocsp_stats, resp);
-        audit_ocsp(req, resp, detail, elapsed_ms_since(started), /*batch_size=*/0);
+        audit_ocsp(req, resp, detail, elapsed_ms_since(started),
+                   /*batch_size=*/0);
         return resp;
     }
 
@@ -283,114 +296,144 @@ public:
     // singleflight_execute()+handle_ocsp_impl() напрямую, а не публичный
     // handle_ocsp() (который сам уже вызывает record_stats — вызов его
     // здесь привёл бы к двойному учёту для элементов-одиночек).
-    proto::FetchOcspBatchResponse handle_ocsp_batch(const proto::FetchOcspBatchRequest& batch_req) {
+    proto::FetchOcspBatchResponse handle_ocsp_batch(
+        proto::FetchOcspBatchRequest const& batch_req) {
         proto::FetchOcspBatchResponse batch_resp;
         batch_resp.responses.resize(batch_req.requests.size());
 
-        std::unordered_map<std::string, std::vector<size_t>> miss_indices_by_url;
+        std::unordered_map<std::string, std::vector<size_t>>
+            miss_indices_by_url;
         for (size_t i = 0; i < batch_req.requests.size(); ++i) {
-            const auto& req = batch_req.requests[i];
-            std::string cache_key = req.responder_url + "|" + ocsp_request_cache_fingerprint(req.request_der);
-            if (auto cached = cache_store.get(cache::EntryKind::Ocsp, cache_key)) {
+            auto const& req = batch_req.requests[i];
+            std::string cache_key =
+                req.responder_url + "|" +
+                ocsp_request_cache_fingerprint(req.request_der);
+            if (auto cached =
+                    cache_store.get(cache::EntryKind::OCSP, cache_key)) {
                 proto::FetchResponse resp;
-                resp.status = proto::FetchStatus::Ok;
+                resp.status = proto::FetchStatus::OK;
                 resp.payload_der = cached->payload;
                 resp.from_cache = true;
                 AuditDetail cache_detail;
                 cache_detail.executed = true;
-                audit_ocsp(req, resp, cache_detail, /*duration_ms=*/0, /*batch_size=*/0);
+                audit_ocsp(req, resp, cache_detail, /*duration_ms=*/0,
+                           /*batch_size=*/0);
                 batch_resp.responses[i] = std::move(resp);
             } else {
                 miss_indices_by_url[req.responder_url].push_back(i);
             }
         }
 
-        for (const auto& [responder_url, indices] : miss_indices_by_url) {
+        for (auto const& [responder_url, indices] : miss_indices_by_url) {
             if (indices.size() == 1) {
-                fetch_single_ocsp_into_batch(batch_req.requests[indices[0]], batch_resp.responses[indices[0]]);
+                fetch_single_ocsp_into_batch(batch_req.requests[indices[0]],
+                                             batch_resp.responses[indices[0]]);
                 continue;
             }
 
             std::vector<std::vector<uint8_t>> request_ders;
             request_ders.reserve(indices.size());
-            for (size_t i : indices) request_ders.push_back(batch_req.requests[i].request_der);
+            for (size_t i : indices) {
+                request_ders.push_back(batch_req.requests[i].request_der);
+            }
 
             auto combined_der = build_combined_ocsp_request(request_ders);
             if (!combined_der) {
                 // Не удалось собрать комбинированный запрос — не проваливаем
                 // весь батч, обслуживаем эту группу как N независимых
                 // одиночных запросов.
-                for (size_t i : indices) fetch_single_ocsp_into_batch(batch_req.requests[i], batch_resp.responses[i]);
+                for (size_t i : indices) {
+                    fetch_single_ocsp_into_batch(batch_req.requests[i],
+                                                 batch_resp.responses[i]);
+                }
                 continue;
             }
 
             uint32_t combined_timeout_ms = 0;
             for (size_t i : indices) {
-                combined_timeout_ms = std::max(combined_timeout_ms, batch_req.requests[i].timeout_ms);
+                combined_timeout_ms = std::max(
+                    combined_timeout_ms, batch_req.requests[i].timeout_ms);
             }
 
-            const auto group_started = std::chrono::steady_clock::now();
+            auto const group_started = std::chrono::steady_clock::now();
             auto http_result = fetch_with_retry_and_circuit_breaker(
-                http::Method::Post, responder_url, *combined_der, "application/ocsp-request",
-                combined_timeout_ms, config.max_ocsp_response_bytes);
-            proto::FetchResponse combined_resp = classify_http_result(http_result);
-            AuditDetail group_detail; // один HTTP round-trip на всю группу — одни и те же детали для всех
+                http::Method::POST, responder_url, *combined_der,
+                "application/ocsp-request", combined_timeout_ms,
+                config.max_ocsp_response_bytes);
+            proto::FetchResponse combined_resp =
+                classify_http_result(http_result);
+            AuditDetail group_detail;  // один HTTP round-trip на всю группу —
+                                       // одни и те же детали для всех
             group_detail.executed = true;
             group_detail.note_http(http_result);
-            const uint64_t group_ms = elapsed_ms_since(group_started);
+            uint64_t const group_ms = elapsed_ms_since(group_started);
 
-            if (combined_resp.status != proto::FetchStatus::Ok) {
+            if (combined_resp.status != proto::FetchStatus::OK) {
                 // Единственный round-trip был общим — его исход общий для
                 // всех участников группы.
                 for (size_t i : indices) {
                     batch_resp.responses[i] = combined_resp;
-                    audit_ocsp(batch_req.requests[i], combined_resp, group_detail, group_ms, indices.size());
+                    audit_ocsp(batch_req.requests[i], combined_resp,
+                               group_detail, group_ms, indices.size());
                 }
                 continue;
             }
 
             for (size_t i : indices) {
-                const auto& req = batch_req.requests[i];
+                auto const& req = batch_req.requests[i];
                 std::string cache_key =
-                    req.responder_url + "|" + ocsp_request_cache_fingerprint(req.request_der);
+                    req.responder_url + "|" +
+                    ocsp_request_cache_fingerprint(req.request_der);
 
                 OCSP_CERTID* certid = extract_certid_dup(req.request_der);
-                int64_t ttl = ocsp_response_ttl_seconds(combined_resp.payload_der, certid);
-                if (certid != nullptr) OCSP_CERTID_free(certid);
+                int64_t ttl = ocsp_response_ttl_seconds(
+                    combined_resp.payload_der, certid);
+                if (certid != nullptr) {
+                    OCSP_CERTID_free(certid);
+                }
                 ttl = apply_http_cache_hints(ttl, http_result.cache_hints);
-                store_in_cache(cache::EntryKind::Ocsp, cache_key, combined_resp.payload_der, ttl);
+                store_in_cache(cache::EntryKind::OCSP, cache_key,
+                               combined_resp.payload_der, ttl);
 
-                batch_resp.responses[i] = combined_resp; // тот же payload_der для каждого — см. protocol.hpp
-                audit_ocsp(req, combined_resp, group_detail, group_ms, indices.size());
+                batch_resp.responses[i] =
+                    combined_resp;  // тот же payload_der для каждого — см.
+                                    // protocol.hpp
+                audit_ocsp(req, combined_resp, group_detail, group_ms,
+                           indices.size());
             }
         }
 
-        for (const auto& resp : batch_resp.responses) {
+        for (auto const& resp : batch_resp.responses) {
             record_stats(ocsp_stats, resp);
         }
         return batch_resp;
     }
 
-    proto::FetchResponse handle_crl(const proto::FetchCrlRequest& req) {
+    proto::FetchResponse handle_crl(proto::FetchCrlRequest const& req) {
         std::string key = "crl|" + req.distribution_point_url;
-        const auto started = std::chrono::steady_clock::now();
+        auto const started = std::chrono::steady_clock::now();
         AuditDetail detail;
-        proto::FetchResponse resp =
-            singleflight_execute(key, [this, &req, &detail] { return handle_crl_impl(req, detail); });
+        proto::FetchResponse resp = singleflight_execute(
+            key,
+            [this, &req, &detail] { return handle_crl_impl(req, detail); });
         record_stats(crl_stats, resp);
-        audit_simple(audit::RequestType::Crl, req.distribution_point_url, resp, detail,
-                     elapsed_ms_since(started));
+        audit_simple(audit::RequestType::CRL, req.distribution_point_url, resp,
+                     detail, elapsed_ms_since(started));
         return resp;
     }
 
-    proto::FetchResponse handle_intermediate_cert(const proto::FetchIntermediateCertRequest& req) {
+    proto::FetchResponse handle_intermediate_cert(
+        proto::FetchIntermediateCertRequest const& req) {
         std::string key = "aia|" + req.aia_url;
-        const auto started = std::chrono::steady_clock::now();
+        auto const started = std::chrono::steady_clock::now();
         AuditDetail detail;
-        proto::FetchResponse resp = singleflight_execute(
-            key, [this, &req, &detail] { return handle_intermediate_cert_impl(req, detail); });
+        proto::FetchResponse resp =
+            singleflight_execute(key, [this, &req, &detail] {
+                return handle_intermediate_cert_impl(req, detail);
+            });
         record_stats(intermediate_cert_stats, resp);
-        audit_simple(audit::RequestType::Aia, req.aia_url, resp, detail, elapsed_ms_since(started));
+        audit_simple(audit::RequestType::AIA, req.aia_url, resp, detail,
+                     elapsed_ms_since(started));
         return resp;
     }
 
@@ -421,11 +464,12 @@ private:
     // менять сигнатуру singleflight_execute() и протаскивать метаданные
     // через разделяемое состояние.
     struct AuditDetail {
-        bool executed = false;   // impl выполнялся в этом потоке
-        std::string reason;      // непусто => демон сам отказался (blocked), см. audit_log.hpp
+        bool executed = false;  // impl выполнялся в этом потоке
+        std::string reason;  // непусто => демон сам отказался (blocked), см.
+                             // audit_log.hpp
         int http_status = 0;
 
-        void note_http(const http::HttpResult& r) {
+        void note_http(http::HttpResult const& r) {
             http_status = r.status_code;
             reason = http::failure_reason_name(r.failure_reason);
         }
@@ -443,13 +487,18 @@ private:
         std::atomic<uint64_t> errors{0};
     };
 
-    static void record_stats(AtomicTypeStats& stats, const proto::FetchResponse& resp) {
+    static void record_stats(AtomicTypeStats& stats,
+                             proto::FetchResponse const& resp) {
         stats.requests.fetch_add(1, std::memory_order_relaxed);
-        if (resp.from_cache) stats.cache_hits.fetch_add(1, std::memory_order_relaxed);
-        if (resp.status != proto::FetchStatus::Ok) stats.errors.fetch_add(1, std::memory_order_relaxed);
+        if (resp.from_cache) {
+            stats.cache_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (resp.status != proto::FetchStatus::OK) {
+            stats.errors.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
-    static proto::RequestTypeStats snapshot(const AtomicTypeStats& stats) {
+    static proto::RequestTypeStats snapshot(AtomicTypeStats const& stats) {
         proto::RequestTypeStats out;
         out.requests = stats.requests.load(std::memory_order_relaxed);
         out.cache_hits = stats.cache_hits.load(std::memory_order_relaxed);
@@ -466,6 +515,20 @@ private:
         std::condition_variable cv;
         bool done = false;
         proto::FetchResponse result;
+        // Заполняется, если impl_fn() лидера завершилась исключением
+        // (ПУНКТ 2.6 ПЛАНА ДОРАБОТКИ, P0): до этого фикса лидер, упавший
+        // с исключением, никогда не доходил до notify_all()/erase() ниже
+        // — последователи ждали state->done вечно, а сама запись
+        // оставалась в inflight_ навсегда, так что и ВСЕ БУДУЩИЕ запросы
+        // с тем же ключом тоже зависали. Теперь любое исключение из
+        // impl_fn() считается частью результата раунда: лидер и все
+        // последователи, ждавшие именно ЭТОТ раунд, получают и
+        // перебрасывают ОДНО и то же исключение (rethrow из
+        // std::exception_ptr безопасен для повторного использования
+        // несколькими потоками), а запись в inflight_ удаляется
+        // ровно так же, как при успехе — ключ свободен для нового
+        // раунда немедленно после этого.
+        std::exception_ptr error;
     };
 
     // Выполняет impl_fn() ровно один раз на все одновременные вызовы с
@@ -477,19 +540,20 @@ private:
     // impl_fn(), иначе несвязанные ключи сериализовались бы друг за
     // другом (регрессия на test_concurrent_fetches_do_not_serialize_
     // on_slow_request).
-    proto::FetchResponse singleflight_execute(const std::string& key,
-                                               const std::function<proto::FetchResponse()>& impl_fn) {
+    proto::FetchResponse singleflight_execute(
+        std::string const& key,
+        std::function<proto::FetchResponse()> const& impl_fn) {
         std::shared_ptr<InFlightState> state;
         bool is_leader = false;
 
         {
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            auto it = inflight_.find(key);
-            if (it != inflight_.end()) {
+            std::lock_guard<std::mutex> lock(inflight_mutex);
+            auto it = inflight.find(key);
+            if (it != inflight.end()) {
                 state = it->second;
             } else {
                 state = std::make_shared<InFlightState>();
-                inflight_.emplace(key, state);
+                inflight.emplace(key, state);
                 is_leader = true;
             }
         }
@@ -497,42 +561,60 @@ private:
         if (!is_leader) {
             std::unique_lock<std::mutex> lock(state->mtx);
             state->cv.wait(lock, [&state] { return state->done; });
+            if (state->error) {
+                std::rethrow_exception(state->error);
+            }
             return state->result;
         }
 
         // Лидер выполняет реальную работу ВНЕ inflight_mutex_ — это
         // именно то, что позволяет несвязанным ключам не сериализоваться.
-        proto::FetchResponse result = impl_fn();
+        // impl_fn() обёрнута в try/catch: что бы ни случилось (успех или
+        // исключение), очистка ниже (notify_all() + erase() из inflight_)
+        // обязана выполниться в любом случае — см. комментарий к полю
+        // InFlightState::error выше.
+        proto::FetchResponse result;
+        std::exception_ptr error;
+        try {
+            result = impl_fn();
+        } catch (...) {
+            error = std::current_exception();
+        }
 
         {
             std::lock_guard<std::mutex> lock(state->mtx);
             state->result = result;
+            state->error = error;
             state->done = true;
         }
         state->cv.notify_all();
 
         {
-            // Убираем запись из map ПОСЛЕ того, как результат уже
-            // выставлен и последователи разбужены — иначе новый запрос,
-            // пришедший в узком окне между erase() и notify_all(), не
-            // нашёл бы ни существующую in-flight запись (стал бы новым
-            // лидером и продублировал сетевой запрос), ни готовый ответ
-            // лидера. Последователи, уже держащие свой shared_ptr<state>,
-            // не пострадают от удаления записи из map — сам объект state
-            // жив, пока жив хотя бы один shared_ptr на него.
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            auto it = inflight_.find(key);
-            if (it != inflight_.end() && it->second == state) {
-                inflight_.erase(it);
+            // Убираем запись из map ПОСЛЕ того, как результат (или
+            // исключение) уже выставлен и последователи разбужены —
+            // иначе новый запрос, пришедший в узком окне между erase() и
+            // notify_all(), не нашёл бы ни существующую in-flight
+            // запись (стал бы новым лидером и продублировал сетевой
+            // запрос), ни готовый ответ лидера. Последователи, уже
+            // держащие свой shared_ptr<state>, не пострадают от удаления
+            // записи из map — сам объект state жив, пока жив хотя бы
+            // один shared_ptr на него.
+            std::lock_guard<std::mutex> lock(inflight_mutex);
+            auto it = inflight.find(key);
+            if (it != inflight.end() && it->second == state) {
+                inflight.erase(it);
             }
         }
 
+        if (error) {
+            std::rethrow_exception(error);
+        }
         return result;
     }
 
     // ROADMAP.md, раздел 2, пункт 10 (P1): экспоненциальный backoff с
     // full jitter — случайная задержка равномерно между 0 и
-    // base*2^(attempt-1) (капнутым сверху kMaxBackoffMs), а не сама
+    // base*2^(attempt-1) (капнутым сверху MAX_BACKOFF_MS), а не сама
     // экспонента без джиттера: full jitter лучше "размазывает" повторные
     // попытки многих одновременных клиентов по времени и не создаёт
     // синхронизированных "волн" ретраев на восстанавливающийся сервер
@@ -540,13 +622,17 @@ private:
     // thread_local генератор — RequestRouter вызывается из нескольких
     // воркер-потоков одновременно, а std::mt19937 не потокобезопасен для
     // конкурентных вызовов у одного и того же экземпляра.
-    static uint32_t compute_backoff_ms(uint32_t attempt, uint32_t base_delay_ms) {
-        constexpr uint32_t kMaxBackoffMs = 5000; // разумный потолок независимо от конфигурации
-        uint64_t exp_delay = static_cast<uint64_t>(base_delay_ms) << (attempt - 1);
-        exp_delay = std::min<uint64_t>(exp_delay, kMaxBackoffMs);
+    static uint32_t compute_backoff_ms(uint32_t attempt,
+                                       uint32_t base_delay_ms) {
+        constexpr uint32_t max_backoff_ms =
+            5000;  // разумный потолок независимо от конфигурации
+        uint64_t exp_delay = static_cast<uint64_t>(base_delay_ms)
+                             << (attempt - 1);
+        exp_delay = std::min<uint64_t>(exp_delay, max_backoff_ms);
 
         thread_local std::mt19937 rng(std::random_device{}());
-        std::uniform_int_distribution<uint32_t> dist(0, static_cast<uint32_t>(exp_delay));
+        std::uniform_int_distribution<uint32_t> dist(
+            0, static_cast<uint32_t>(exp_delay));
         return dist(rng);
     }
 
@@ -559,52 +645,72 @@ private:
     // см. комментарий в начале файла про то, почему это важно
     // (D-Bus-вызов клиента сам таймаутится по этому же значению).
     template <typename ResultT, typename AttemptFn>
-    ResultT retry_with_backoff(uint32_t overall_timeout_ms, AttemptFn&& attempt_fn) {
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(overall_timeout_ms);
+    ResultT retry_with_backoff(uint32_t overall_timeout_ms,
+                               AttemptFn&& attempt_fn) {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(overall_timeout_ms);
         ResultT result{};
 
         for (uint32_t attempt = 0;; ++attempt) {
             auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) break;
+            if (now >= deadline) {
+                break;
+            }
             uint32_t remaining_ms = static_cast<uint32_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                      now)
+                    .count());
 
             result = attempt_fn(remaining_ms);
-            if (result.ok) return result;
+            if (result.ok) {
+                return result;
+            }
 
-            if (attempt >= config.max_retries) break;
+            if (attempt >= config.max_retries) {
+                break;
+            }
 
             now = std::chrono::steady_clock::now();
-            if (now >= deadline) break;
+            if (now >= deadline) {
+                break;
+            }
             uint32_t remaining_before_sleep = static_cast<uint32_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
-            uint32_t backoff = compute_backoff_ms(attempt + 1, config.retry_base_delay_ms);
-            if (backoff >= remaining_before_sleep) break; // бюджета на осмысленный повтор уже не осталось
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                      now)
+                    .count());
+            uint32_t backoff =
+                compute_backoff_ms(attempt + 1, config.retry_base_delay_ms);
+            if (backoff >= remaining_before_sleep) {
+                break;  // бюджета на осмысленный повтор уже не осталось
+            }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
         }
         return result;
     }
 
-    http::HttpResult fetch_with_retry(http::Method method, const std::string& url,
-                                       const std::vector<uint8_t>& post_body,
-                                       const std::string& post_content_type, uint32_t overall_timeout_ms,
-                                       size_t max_response_bytes) {
+    http::HttpResult fetch_with_retry(http::Method method,
+                                      std::string const& url,
+                                      std::vector<uint8_t> const& post_body,
+                                      std::string const& post_content_type,
+                                      uint32_t overall_timeout_ms,
+                                      size_t max_response_bytes) {
         return retry_with_backoff<http::HttpResult>(
             overall_timeout_ms, [&](uint32_t per_attempt_timeout_ms) {
-                return http_fetcher.fetch(method, url, post_body, post_content_type,
-                                           per_attempt_timeout_ms, max_response_bytes);
+                return http_fetcher.fetch(
+                    method, url, post_body, post_content_type,
+                    per_attempt_timeout_ms, max_response_bytes);
             });
     }
 
     // ROADMAP.md, раздел 2, пункт 11 (P1): circuit breaker per-host — см.
     // подробный комментарий в начале файла. Три состояния классического
     // паттерна (Closed/Open/HalfOpen).
-    enum class CircuitState { Closed, Open, HalfOpen };
+    enum class CircuitState { CLOSED, OPEN, HALF_OPEN };
 
     struct CircuitBreakerState {
         std::mutex mtx;
-        CircuitState state = CircuitState::Closed;
+        CircuitState state = CircuitState::CLOSED;
         uint32_t consecutive_failures = 0;
         std::chrono::steady_clock::time_point opened_at;
     };
@@ -614,25 +720,30 @@ private:
     // варианта — см. http_client.hpp). Для URL, не начинающихся с http(s)
     // (сейчас — ldap://), возвращает nullopt: см. комментарий в начале
     // файла про то, что ldap:// сознательно не покрыт circuit breaker'ом.
-    static std::optional<std::string> host_port_key(const std::string& url) {
+    static std::optional<std::string> host_port_key(std::string const& url) {
         auto parsed = http::parse_http_url(url);
-        if (!parsed) return std::nullopt;
+        if (!parsed) {
+            return std::nullopt;
+        }
         return parsed->host + ":" + std::to_string(parsed->port);
     }
 
-    std::shared_ptr<CircuitBreakerState> get_or_create_breaker(const std::string& host_port) {
-        std::lock_guard<std::mutex> lock(breakers_mutex_);
-        auto it = breakers_.find(host_port);
-        if (it != breakers_.end()) return it->second;
+    std::shared_ptr<CircuitBreakerState> get_or_create_breaker(
+        std::string const& host_port) {
+        std::lock_guard<std::mutex> lock(breakers_mutex);
+        auto it = breakers.find(host_port);
+        if (it != breakers.end()) {
+            return it->second;
+        }
 
-        if (breakers_.size() >= config.circuit_breaker_max_tracked_hosts) {
+        if (breakers.size() >= config.circuit_breaker_max_tracked_hosts) {
             // Простая защита от неограниченного роста, не строгий LRU —
             // см. комментарий в начале файла про то, почему это
             // достаточно для этого случая.
-            breakers_.erase(breakers_.begin());
+            breakers.erase(breakers.begin());
         }
         auto state = std::make_shared<CircuitBreakerState>();
-        breakers_.emplace(host_port, state);
+        breakers.emplace(host_port, state);
         return state;
     }
 
@@ -643,50 +754,57 @@ private:
     // пропускает вызвавшего как пробу (см. упрощение в комментарии в
     // начале файла: несколько конкурентных вызовов могут пройти как
     // "пробные" одновременно).
-    bool circuit_should_fail_fast(const std::string& host_port) {
+    bool circuit_should_fail_fast(std::string const& host_port) {
         std::shared_ptr<CircuitBreakerState> state;
         {
-            std::lock_guard<std::mutex> lock(breakers_mutex_);
-            auto it = breakers_.find(host_port);
-            if (it == breakers_.end()) return false;
+            std::lock_guard<std::mutex> lock(breakers_mutex);
+            auto it = breakers.find(host_port);
+            if (it == breakers.end()) {
+                return false;
+            }
             state = it->second;
         }
 
         std::lock_guard<std::mutex> lock(state->mtx);
-        if (state->state != CircuitState::Open) return false;
+        if (state->state != CircuitState::OPEN) {
+            return false;
+        }
 
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::steady_clock::now() - state->opened_at)
                            .count();
-        if (elapsed < static_cast<int64_t>(config.circuit_breaker_cooldown_seconds)) {
-            return true; // всё ещё открыт — отказываем без попытки соединения
+        if (elapsed <
+            static_cast<int64_t>(config.circuit_breaker_cooldown_seconds)) {
+            return true;  // всё ещё открыт — отказываем без попытки соединения
         }
-        state->state = CircuitState::HalfOpen; // cooldown истёк — пропускаем как пробу
+        state->state =
+            CircuitState::HALF_OPEN;  // cooldown истёк — пропускаем как пробу
         return false;
     }
 
-    void circuit_record_success(const std::string& host_port) {
+    void circuit_record_success(std::string const& host_port) {
         auto state = get_or_create_breaker(host_port);
         std::lock_guard<std::mutex> lock(state->mtx);
         state->consecutive_failures = 0;
-        state->state = CircuitState::Closed;
+        state->state = CircuitState::CLOSED;
     }
 
-    void circuit_record_failure(const std::string& host_port) {
+    void circuit_record_failure(std::string const& host_port) {
         auto state = get_or_create_breaker(host_port);
         std::lock_guard<std::mutex> lock(state->mtx);
         ++state->consecutive_failures;
 
-        if (state->state == CircuitState::HalfOpen) {
+        if (state->state == CircuitState::HALF_OPEN) {
             // Пробный запрос после cooldown не удался — открываем снова
             // со свежим cooldown, не дожидаясь повторного накопления
             // failure_threshold с нуля (хост подтвердил, что всё ещё плох).
-            state->state = CircuitState::Open;
+            state->state = CircuitState::OPEN;
             state->opened_at = std::chrono::steady_clock::now();
             return;
         }
-        if (state->consecutive_failures >= config.circuit_breaker_failure_threshold) {
-            state->state = CircuitState::Open;
+        if (state->consecutive_failures >=
+            config.circuit_breaker_failure_threshold) {
+            state->state = CircuitState::OPEN;
             state->opened_at = std::chrono::steady_clock::now();
         }
     }
@@ -698,20 +816,22 @@ private:
     // внутренних retry) обновляет состояние breaker'а — см. комментарий в
     // начале файла про то, почему breaker считает ЗАПРОСЫ, а не отдельные
     // попытки ретрая внутри одного запроса.
-    http::HttpResult fetch_with_retry_and_circuit_breaker(http::Method method, const std::string& url,
-                                                            const std::vector<uint8_t>& post_body,
-                                                            const std::string& post_content_type,
-                                                            uint32_t overall_timeout_ms,
-                                                            size_t max_response_bytes) {
+    http::HttpResult fetch_with_retry_and_circuit_breaker(
+        http::Method method, std::string const& url,
+        std::vector<uint8_t> const& post_body,
+        std::string const& post_content_type, uint32_t overall_timeout_ms,
+        size_t max_response_bytes) {
         auto host_port = host_port_key(url);
         if (host_port && circuit_should_fail_fast(*host_port)) {
-            http::HttpResult blocked; // ok=false по умолчанию
-            blocked.failure_reason = http::FailureReason::CircuitOpen; // для аудита (п.23)
+            http::HttpResult blocked;  // ok=false по умолчанию
+            blocked.failure_reason =
+                http::FailureReason::CIRCUIT_OPEN;  // для аудита (п.23)
             return blocked;
         }
 
         auto result =
-            fetch_with_retry(method, url, post_body, post_content_type, overall_timeout_ms, max_response_bytes);
+            fetch_with_retry(method, url, post_body, post_content_type,
+                             overall_timeout_ms, max_response_bytes);
 
         if (host_port) {
             if (result.ok) {
@@ -727,46 +847,59 @@ private:
     // выше) — та же singleflight-обёртка, что и в публичном handle_ocsp(),
     // но БЕЗ record_stats() (батч сам записывает статистику один раз в
     // конце для всех своих элементов одинаково — см. комментарий там).
-    void fetch_single_ocsp_into_batch(const proto::FetchOcspRequest& req, proto::FetchResponse& out) {
-        std::string key = "ocsp|" + req.responder_url + "|" + ocsp_request_cache_fingerprint(req.request_der);
-        const auto started = std::chrono::steady_clock::now();
+    void fetch_single_ocsp_into_batch(proto::FetchOcspRequest const& req,
+                                      proto::FetchResponse& out) {
+        std::string key = "ocsp|" + req.responder_url + "|" +
+                          ocsp_request_cache_fingerprint(req.request_der);
+        auto const started = std::chrono::steady_clock::now();
         AuditDetail detail;
-        out = singleflight_execute(key, [this, &req, &detail] { return handle_ocsp_impl(req, detail); });
-        audit_ocsp(req, out, detail, elapsed_ms_since(started), /*batch_size=*/0);
+        out = singleflight_execute(key, [this, &req, &detail] {
+            return handle_ocsp_impl(req, detail);
+        });
+        audit_ocsp(req, out, detail, elapsed_ms_since(started),
+                   /*batch_size=*/0);
     }
 
-    proto::FetchResponse handle_ocsp_impl(const proto::FetchOcspRequest& req, AuditDetail& detail) {
-        detail.executed = true; // мы — лидер singleflight (последователи сюда не заходят)
-        std::string cache_key = req.responder_url + "|" + ocsp_request_cache_fingerprint(req.request_der);
+    proto::FetchResponse handle_ocsp_impl(proto::FetchOcspRequest const& req,
+                                          AuditDetail& detail) {
+        detail.executed =
+            true;  // мы — лидер singleflight (последователи сюда не заходят)
+        std::string cache_key = req.responder_url + "|" +
+                                ocsp_request_cache_fingerprint(req.request_der);
 
-        if (auto cached = cache_store.get(cache::EntryKind::Ocsp, cache_key)) {
+        if (auto cached = cache_store.get(cache::EntryKind::OCSP, cache_key)) {
             proto::FetchResponse resp;
-            resp.status = proto::FetchStatus::Ok;
+            resp.status = proto::FetchStatus::OK;
             resp.payload_der = cached->payload;
             resp.from_cache = true;
             return resp;
         }
 
-        auto http_result = fetch_with_retry_and_circuit_breaker(http::Method::Post, req.responder_url, req.request_der,
-                                        "application/ocsp-request", req.timeout_ms,
-                                        config.max_ocsp_response_bytes);
+        auto http_result = fetch_with_retry_and_circuit_breaker(
+            http::Method::POST, req.responder_url, req.request_der,
+            "application/ocsp-request", req.timeout_ms,
+            config.max_ocsp_response_bytes);
         detail.note_http(http_result);
         proto::FetchResponse resp = classify_http_result(http_result);
-        if (resp.status != proto::FetchStatus::Ok) return resp;
+        if (resp.status != proto::FetchStatus::OK) {
+            return resp;
+        }
 
         int64_t ttl = ocsp_response_ttl_seconds(resp.payload_der);
         ttl = apply_http_cache_hints(ttl, http_result.cache_hints);
-        store_in_cache(cache::EntryKind::Ocsp, cache_key, resp.payload_der, ttl);
+        store_in_cache(cache::EntryKind::OCSP, cache_key, resp.payload_der,
+                       ttl);
         return resp;
     }
 
-    proto::FetchResponse handle_crl_impl(const proto::FetchCrlRequest& req, AuditDetail& detail) {
+    proto::FetchResponse handle_crl_impl(proto::FetchCrlRequest const& req,
+                                         AuditDetail& detail) {
         detail.executed = true;
         std::string cache_key = req.distribution_point_url;
 
-        if (auto cached = cache_store.get(cache::EntryKind::Crl, cache_key)) {
+        if (auto cached = cache_store.get(cache::EntryKind::CRL, cache_key)) {
             proto::FetchResponse resp;
-            resp.status = proto::FetchStatus::Ok;
+            resp.status = proto::FetchStatus::OK;
             resp.payload_der = cached->payload;
             resp.from_cache = true;
             return resp;
@@ -784,20 +917,24 @@ private:
             return handle_crl_via_ldap(req, cache_key, detail);
         }
 
-        auto http_result = fetch_with_retry_and_circuit_breaker(http::Method::Get, req.distribution_point_url, {}, "",
-                                        req.timeout_ms, config.max_crl_response_bytes);
+        auto http_result = fetch_with_retry_and_circuit_breaker(
+            http::Method::GET, req.distribution_point_url, {}, "",
+            req.timeout_ms, config.max_crl_response_bytes);
         detail.note_http(http_result);
         proto::FetchResponse resp = classify_http_result(http_result);
-        if (resp.status != proto::FetchStatus::Ok) return resp;
+        if (resp.status != proto::FetchStatus::OK) {
+            return resp;
+        }
 
         int64_t ttl = crl_ttl_seconds(resp.payload_der);
         ttl = apply_http_cache_hints(ttl, http_result.cache_hints);
-        store_in_cache(cache::EntryKind::Crl, cache_key, resp.payload_der, ttl);
+        store_in_cache(cache::EntryKind::CRL, cache_key, resp.payload_der, ttl);
         return resp;
     }
 
-    proto::FetchResponse handle_crl_via_ldap(const proto::FetchCrlRequest& req, const std::string& cache_key,
-                                              AuditDetail& detail) {
+    proto::FetchResponse handle_crl_via_ldap(proto::FetchCrlRequest const& req,
+                                             std::string const& cache_key,
+                                             AuditDetail& detail) {
         proto::FetchResponse resp;
         if (ldap_fetcher == nullptr) {
             detail.reason = "ldap_disabled";
@@ -805,7 +942,7 @@ private:
             // осознанный "fail closed по умолчанию", что и для https://
             // (ROADMAP.md п.7): новая, неаудированная поверхность разбора
             // BER от недоверенного сервера не включается неявно.
-            resp.status = proto::FetchStatus::NetworkError;
+            resp.status = proto::FetchStatus::NETWORK_ERROR;
             return resp;
         }
 
@@ -817,16 +954,18 @@ private:
         // ищет именно это имя среди возвращённых сервером значений
         // (сравнение регистронезависимое, без учёта суффикса ";binary" —
         // см. ldap_client.hpp::detail::attrs_match()).
-        auto ldap_result =
-            ldap_fetcher->fetch(req.distribution_point_url, "certificateRevocationList;binary",
-                                 req.timeout_ms, config.max_crl_response_bytes);
+        auto ldap_result = ldap_fetcher->fetch(
+            req.distribution_point_url, "certificateRevocationList;binary",
+            req.timeout_ms, config.max_crl_response_bytes);
         if (!ldap_result.ok) {
-            if (ldap_result.policy_denied) detail.reason = "policy_denied";
-            resp.status = proto::FetchStatus::NetworkError;
+            if (ldap_result.policy_denied) {
+                detail.reason = "policy_denied";
+            }
+            resp.status = proto::FetchStatus::NETWORK_ERROR;
             return resp;
         }
 
-        resp.status = proto::FetchStatus::Ok;
+        resp.status = proto::FetchStatus::OK;
         resp.payload_der = std::move(ldap_result.value);
 
         int64_t ttl = crl_ttl_seconds(resp.payload_der);
@@ -834,28 +973,32 @@ private:
         // apply_http_cache_hints() здесь неприменим, TTL определяется
         // только nextUpdate самого CRL (и max_crl_ttl_seconds сверху,
         // как обычно — clamp уже встроен в crl_ttl_seconds()).
-        store_in_cache(cache::EntryKind::Crl, cache_key, resp.payload_der, ttl);
+        store_in_cache(cache::EntryKind::CRL, cache_key, resp.payload_der, ttl);
         return resp;
     }
 
-    proto::FetchResponse handle_intermediate_cert_impl(const proto::FetchIntermediateCertRequest& req,
-                                                        AuditDetail& detail) {
+    proto::FetchResponse handle_intermediate_cert_impl(
+        proto::FetchIntermediateCertRequest const& req, AuditDetail& detail) {
         detail.executed = true;
         std::string cache_key = req.aia_url;
 
-        if (auto cached = cache_store.get(cache::EntryKind::IntermediateCert, cache_key)) {
+        if (auto cached = cache_store.get(cache::EntryKind::INTERMEDIATE_CERT,
+                                          cache_key)) {
             proto::FetchResponse resp;
-            resp.status = proto::FetchStatus::Ok;
+            resp.status = proto::FetchStatus::OK;
             resp.payload_der = cached->payload;
             resp.from_cache = true;
             return resp;
         }
 
-        auto http_result = fetch_with_retry_and_circuit_breaker(http::Method::Get, req.aia_url, {}, "", req.timeout_ms,
-                                        config.max_aia_response_bytes);
+        auto http_result = fetch_with_retry_and_circuit_breaker(
+            http::Method::GET, req.aia_url, {}, "", req.timeout_ms,
+            config.max_aia_response_bytes);
         detail.note_http(http_result);
         proto::FetchResponse resp = classify_http_result(http_result);
-        if (resp.status != proto::FetchStatus::Ok) return resp;
+        if (resp.status != proto::FetchStatus::OK) {
+            return resp;
+        }
 
         // caIssuers-ответ иногда приходит как application/pkcs7-mime
         // (PKCS#7 "degenerate" контейнер с сертификатами) вместо голого
@@ -867,14 +1010,16 @@ private:
         auto extracted = extract_single_der_certificate(resp.payload_der);
         if (!extracted) {
             proto::FetchResponse invalid;
-            invalid.status = proto::FetchStatus::InvalidResponse;
+            invalid.status = proto::FetchStatus::INVALID_RESPONSE;
             return invalid;
         }
         resp.payload_der = std::move(*extracted);
 
-        int64_t ttl = apply_http_cache_hints(config.aia_ttl_seconds, http_result.cache_hints);
+        int64_t ttl = apply_http_cache_hints(config.aia_ttl_seconds,
+                                             http_result.cache_hints);
         ttl = clamp_ttl_to_cert_not_after(ttl, resp.payload_der);
-        store_in_cache(cache::EntryKind::IntermediateCert, cache_key, resp.payload_der, ttl);
+        store_in_cache(cache::EntryKind::INTERMEDIATE_CERT, cache_key,
+                       resp.payload_der, ttl);
         return resp;
     }
 
@@ -882,8 +1027,11 @@ private:
     // ответа сервера (Cache-Control/Expires) — сервер может TTL только
     // укоротить, см. комментарий над классом. no-store/no-cache приводят
     // к ttl=0, что store_in_cache() трактует как "вообще не кэшировать".
-    static int64_t apply_http_cache_hints(int64_t computed_ttl, const http::CacheHints& hints) {
-        if (hints.no_store || hints.no_cache) return 0;
+    static int64_t apply_http_cache_hints(int64_t computed_ttl,
+                                          http::CacheHints const& hints) {
+        if (hints.no_store || hints.no_cache) {
+            return 0;
+        }
 
         int64_t ttl = computed_ttl;
         if (hints.max_age_seconds) {
@@ -895,78 +1043,93 @@ private:
         }
         return ttl;
     }
-    static proto::FetchResponse classify_http_result(const http::HttpResult& r) {
+    static proto::FetchResponse classify_http_result(
+        http::HttpResult const& r) {
         proto::FetchResponse resp;
         if (r.timed_out) {
-            resp.status = proto::FetchStatus::Timeout;
+            resp.status = proto::FetchStatus::TIMEOUT;
             return resp;
         }
         if (!r.ok) {
-            resp.status = proto::FetchStatus::NetworkError;
+            resp.status = proto::FetchStatus::NETWORK_ERROR;
             return resp;
         }
         if (r.status_code < 200 || r.status_code >= 300) {
-            resp.status = proto::FetchStatus::NetworkError;
+            resp.status = proto::FetchStatus::NETWORK_ERROR;
             return resp;
         }
         if (r.body.empty()) {
-            resp.status = proto::FetchStatus::InvalidResponse;
+            resp.status = proto::FetchStatus::INVALID_RESPONSE;
             return resp;
         }
-        resp.status = proto::FetchStatus::Ok;
+        resp.status = proto::FetchStatus::OK;
         resp.payload_der = r.body;
         resp.from_cache = false;
         return resp;
     }
 
-    static uint64_t elapsed_ms_since(std::chrono::steady_clock::time_point started) {
-        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - started)
-                                         .count());
+    static uint64_t elapsed_ms_since(
+        std::chrono::steady_clock::time_point started) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count());
     }
 
-    static audit::FetchEvent make_audit_event(audit::RequestType type, const std::string& url,
-                                              const proto::FetchResponse& resp, const AuditDetail& detail,
+    static audit::FetchEvent make_audit_event(audit::RequestType type,
+                                              std::string const& url,
+                                              proto::FetchResponse const& resp,
+                                              AuditDetail const& detail,
                                               uint64_t duration_ms) {
         audit::FetchEvent e;
         e.type = type;
         e.url = url;
         e.result = audit::status_name(resp.status);
         if (!detail.executed) {
-            e.decision = audit::Decision::SharedInflight;
+            e.decision = audit::Decision::SHARED_INFLIGHT;
         } else if (resp.from_cache) {
-            e.decision = audit::Decision::CacheHit;
+            e.decision = audit::Decision::CACHE_HIT;
         } else if (!detail.reason.empty()) {
-            e.decision = audit::Decision::Blocked;
+            e.decision = audit::Decision::BLOCKED;
             e.reason = detail.reason;
         } else {
-            e.decision = audit::Decision::NetworkFetch;
+            e.decision = audit::Decision::NETWORK_FETCH;
         }
-        e.bytes = (resp.status == proto::FetchStatus::Ok) ? resp.payload_der.size() : 0;
+        e.bytes = (resp.status == proto::FetchStatus::OK)
+                      ? resp.payload_der.size()
+                      : 0;
         e.duration_ms = duration_ms;
         e.http_status = detail.http_status;
         return e;
     }
 
-    void emit_audit(const audit::FetchEvent& event) {
-        // Аудит не должен ронять/задерживать обработку запроса из-за собственного сбоя.
+    void emit_audit(audit::FetchEvent const& event) {
+        // Аудит не должен ронять/задерживать обработку запроса из-за
+        // собственного сбоя.
         try {
-            audit_sink_->record("fetch", audit::to_fields(event));
+            audit_sink->record("fetch", audit::to_fields(event));
         } catch (...) {
         }
     }
 
-    void audit_simple(audit::RequestType type, const std::string& url, const proto::FetchResponse& resp,
-                      const AuditDetail& detail, uint64_t duration_ms) {
-        if (audit_sink_ == nullptr) return;
+    void audit_simple(audit::RequestType type, std::string const& url,
+                      proto::FetchResponse const& resp,
+                      AuditDetail const& detail, uint64_t duration_ms) {
+        if (audit_sink == nullptr) {
+            return;
+        }
         emit_audit(make_audit_event(type, url, resp, detail, duration_ms));
     }
 
-    void audit_ocsp(const proto::FetchOcspRequest& req, const proto::FetchResponse& resp,
-                    const AuditDetail& detail, uint64_t duration_ms, size_t batch_size) {
-        if (audit_sink_ == nullptr) return; // не тратим время на разбор запроса ради serial
+    void audit_ocsp(proto::FetchOcspRequest const& req,
+                    proto::FetchResponse const& resp, AuditDetail const& detail,
+                    uint64_t duration_ms, size_t batch_size) {
+        if (audit_sink == nullptr) {
+            return;  // не тратим время на разбор запроса ради serial
+        }
         audit::FetchEvent e =
-            make_audit_event(audit::RequestType::Ocsp, req.responder_url, resp, detail, duration_ms);
+            make_audit_event(audit::RequestType::OCSP, req.responder_url, resp,
+                             detail, duration_ms);
         e.serial = ocsp_request_serial_hex(req.request_der);
         e.batch_size = static_cast<uint32_t>(batch_size);
         emit_audit(e);
@@ -976,12 +1139,17 @@ private:
     // CertID OCSP-запроса; пустая строка, если запрос не разобрался. URL
     // responder'а один на тысячи сертификатов — без serial аудит не
     // отвечал бы на вопрос "статус КАКОГО сертификата запрашивали".
-    static std::string ocsp_request_serial_hex(const std::vector<uint8_t>& request_der) {
+    static std::string ocsp_request_serial_hex(
+        std::vector<uint8_t> const& request_der) {
         OCSP_CERTID* cert_id = extract_certid_dup(request_der);
-        if (cert_id == nullptr) return {};
+        if (cert_id == nullptr) {
+            return {};
+        }
         std::string out;
         ASN1_INTEGER* serial = nullptr;
-        if (OCSP_id_get0_info(nullptr, nullptr, nullptr, &serial, cert_id) == 1 && serial != nullptr) {
+        if (OCSP_id_get0_info(nullptr, nullptr, nullptr, &serial, cert_id) ==
+                1 &&
+            serial != nullptr) {
             if (BIGNUM* bn = ASN1_INTEGER_to_BN(serial, nullptr)) {
                 if (char* hex = BN_bn2hex(bn)) {
                     out = hex;
@@ -994,9 +1162,12 @@ private:
         return out;
     }
 
-    void store_in_cache(cache::EntryKind kind, const std::string& key,
-                         const std::vector<uint8_t>& payload, int64_t ttl_seconds) {
-        if (ttl_seconds <= 0) return; // отрицательный/нулевой TTL — не кэшируем вовсе
+    void store_in_cache(cache::EntryKind kind, std::string const& key,
+                        std::vector<uint8_t> const& payload,
+                        int64_t ttl_seconds) {
+        if (ttl_seconds <= 0) {
+            return;  // отрицательный/нулевой TTL — не кэшируем вовсе
+        }
         cache::CacheEntry entry;
         entry.payload = payload;
         entry.fetched_at = now_seconds();
@@ -1014,10 +1185,10 @@ private:
     // хеш безопасности ради — нужен только чтобы разные serialNumber на
     // одном responder_url не путались в кэше). SHA-256 тут просто удобная
     // готовая функция, а не защита от подмены.
-    static std::string der_fingerprint(const std::vector<uint8_t>& der) {
+    static std::string der_fingerprint(std::vector<uint8_t> const& der) {
         unsigned char digest[SHA256_DIGEST_LENGTH];
         SHA256(der.data(), der.size(), digest);
-        static const char* hex = "0123456789abcdef";
+        static char const* hex = "0123456789abcdef";
         std::string out;
         out.reserve(SHA256_DIGEST_LENGTH * 2);
         for (unsigned char b : digest) {
@@ -1047,9 +1218,11 @@ private:
     // откатываемся на прежнее поведение (фингерпринт всего DER), чтобы не
     // ломать кэширование для таких клиентов: они не добавляют nonce, так
     // что старая стратегия для них и так корректна.
-    static std::string ocsp_request_cache_fingerprint(const std::vector<uint8_t>& request_der) {
-        const unsigned char* p = request_der.data();
-        OCSP_REQUEST* ocsp_req = d2i_OCSP_REQUEST(nullptr, &p, static_cast<long>(request_der.size()));
+    static std::string ocsp_request_cache_fingerprint(
+        std::vector<uint8_t> const& request_der) {
+        unsigned char const* p = request_der.data();
+        OCSP_REQUEST* ocsp_req = d2i_OCSP_REQUEST(
+            nullptr, &p, static_cast<long>(request_der.size()));
         if (ocsp_req == nullptr) {
             return der_fingerprint(request_der);
         }
@@ -1061,7 +1234,8 @@ private:
         }
 
         OCSP_ONEREQ* one_req = OCSP_request_onereq_get0(ocsp_req, 0);
-        OCSP_CERTID* cert_id = (one_req != nullptr) ? OCSP_onereq_get0_id(one_req) : nullptr;
+        OCSP_CERTID* cert_id =
+            (one_req != nullptr) ? OCSP_onereq_get0_id(one_req) : nullptr;
         if (cert_id == nullptr) {
             OCSP_REQUEST_free(ocsp_req);
             return der_fingerprint(request_der);
@@ -1069,12 +1243,14 @@ private:
 
         unsigned char* cert_id_der = nullptr;
         int cert_id_len = i2d_OCSP_CERTID(cert_id, &cert_id_der);
-        OCSP_REQUEST_free(ocsp_req); // cert_id указывал внутрь ocsp_req — освобождать после i2d, не раньше
+        OCSP_REQUEST_free(ocsp_req);  // cert_id указывал внутрь ocsp_req —
+                                      // освобождать после i2d, не раньше
 
         if (cert_id_len <= 0 || cert_id_der == nullptr) {
             return der_fingerprint(request_der);
         }
-        std::vector<uint8_t> cert_id_bytes(cert_id_der, cert_id_der + cert_id_len);
+        std::vector<uint8_t> cert_id_bytes(cert_id_der,
+                                           cert_id_der + cert_id_len);
         OPENSSL_free(cert_id_der);
         return der_fingerprint(cert_id_bytes);
     }
@@ -1088,16 +1264,23 @@ private:
     // (OCSP_CERTID_dup) — исходный OCSP_REQUEST, из которого CertID
     // извлекается, освобождается сразу после вызова, так что вызывающий
     // код обязан сам освободить результат через OCSP_CERTID_free().
-    static OCSP_CERTID* extract_certid_dup(const std::vector<uint8_t>& request_der) {
-        const unsigned char* p = request_der.data();
-        OCSP_REQUEST* ocsp_req = d2i_OCSP_REQUEST(nullptr, &p, static_cast<long>(request_der.size()));
-        if (ocsp_req == nullptr) return nullptr;
+    static OCSP_CERTID* extract_certid_dup(
+        std::vector<uint8_t> const& request_der) {
+        unsigned char const* p = request_der.data();
+        OCSP_REQUEST* ocsp_req = d2i_OCSP_REQUEST(
+            nullptr, &p, static_cast<long>(request_der.size()));
+        if (ocsp_req == nullptr) {
+            return nullptr;
+        }
 
         OCSP_CERTID* result = nullptr;
         if (OCSP_request_onereq_count(ocsp_req) > 0) {
             OCSP_ONEREQ* one_req = OCSP_request_onereq_get0(ocsp_req, 0);
-            OCSP_CERTID* cert_id = (one_req != nullptr) ? OCSP_onereq_get0_id(one_req) : nullptr;
-            if (cert_id != nullptr) result = OCSP_CERTID_dup(cert_id);
+            OCSP_CERTID* cert_id =
+                (one_req != nullptr) ? OCSP_onereq_get0_id(one_req) : nullptr;
+            if (cert_id != nullptr) {
+                result = OCSP_CERTID_dup(cert_id);
+            }
         }
         OCSP_REQUEST_free(ocsp_req);
         return result;
@@ -1116,17 +1299,18 @@ private:
     // nullopt группа обрабатывается как набор независимых одиночных
     // запросов, не как ошибка всего батча).
     static std::optional<std::vector<uint8_t>> build_combined_ocsp_request(
-        const std::vector<std::vector<uint8_t>>& request_ders) {
+        std::vector<std::vector<uint8_t>> const& request_ders) {
         OCSP_REQUEST* combined = OCSP_REQUEST_new();
         bool ok = true;
-        for (const auto& der : request_ders) {
+        for (auto const& der : request_ders) {
             OCSP_CERTID* dup = extract_certid_dup(der);
             if (dup == nullptr) {
                 ok = false;
                 break;
             }
             if (OCSP_request_add0_id(combined, dup) == nullptr) {
-                OCSP_CERTID_free(dup); // add0_id не принял — владение НЕ перешло, освобождаем сами
+                OCSP_CERTID_free(dup);  // add0_id не принял — владение НЕ
+                                        // перешло, освобождаем сами
                 ok = false;
                 break;
             }
@@ -1140,7 +1324,9 @@ private:
         unsigned char* out_der = nullptr;
         int len = i2d_OCSP_REQUEST(combined, &out_der);
         OCSP_REQUEST_free(combined);
-        if (len <= 0 || out_der == nullptr) return std::nullopt;
+        if (len <= 0 || out_der == nullptr) {
+            return std::nullopt;
+        }
 
         std::vector<uint8_t> result(out_der, out_der + len);
         OPENSSL_free(out_der);
@@ -1157,11 +1343,15 @@ private:
     // исходных батч-запросов — нужно найти именно СВОЙ. certid == nullptr
     // (одиночный, небатчевый fetch_ocsp) сохраняет прежнее поведение —
     // берём первый (и обычно единственный) SingleResponse.
-    int64_t ocsp_response_ttl_seconds(const std::vector<uint8_t>& der, const OCSP_CERTID* certid = nullptr) {
-        const unsigned char* p = der.data();
-        OCSP_RESPONSE* ocsp_resp = d2i_OCSP_RESPONSE(nullptr, &p, static_cast<long>(der.size()));
+    int64_t ocsp_response_ttl_seconds(std::vector<uint8_t> const& der,
+                                      OCSP_CERTID const* certid = nullptr) {
+        unsigned char const* p = der.data();
+        OCSP_RESPONSE* ocsp_resp =
+            d2i_OCSP_RESPONSE(nullptr, &p, static_cast<long>(der.size()));
         if (ocsp_resp == nullptr) {
-            return clamp_ocsp_ttl(config.default_ocsp_ttl_seconds); // не разобрали — короткий дефолтный TTL
+            return clamp_ocsp_ttl(
+                config.default_ocsp_ttl_seconds);  // не разобрали — короткий
+                                                   // дефолтный TTL
         }
 
         int64_t ttl = config.default_ocsp_ttl_seconds;
@@ -1169,8 +1359,11 @@ private:
         if (basic != nullptr) {
             int index = 0;
             if (certid != nullptr) {
-                int found = OCSP_resp_find(basic, const_cast<OCSP_CERTID*>(certid), -1);
-                if (found >= 0) index = found;
+                int found =
+                    OCSP_resp_find(basic, const_cast<OCSP_CERTID*>(certid), -1);
+                if (found >= 0) {
+                    index = found;
+                }
                 // Не нашли (не должно случаться, если ответ реально
                 // содержит статус запрошенного сертификата) — остаёмся на
                 // index 0, тот же fallback, что и для certid == nullptr.
@@ -1178,12 +1371,15 @@ private:
             OCSP_SINGLERESP* single = OCSP_resp_get0(basic, index);
             if (single != nullptr) {
                 ASN1_GENERALIZEDTIME* next_update = nullptr;
-                if (OCSP_single_get0_status(single, nullptr, nullptr, nullptr, &next_update) >= 0 &&
+                if (OCSP_single_get0_status(single, nullptr, nullptr, nullptr,
+                                            &next_update) >= 0 &&
                     next_update != nullptr) {
                     auto parsed = asn1_time_to_unix(next_update);
                     if (parsed) {
                         int64_t seconds_from_now = *parsed - now_seconds();
-                        if (seconds_from_now > 0) ttl = seconds_from_now;
+                        if (seconds_from_now > 0) {
+                            ttl = seconds_from_now;
+                        }
                     }
                 }
             }
@@ -1193,19 +1389,22 @@ private:
         return clamp_ocsp_ttl(ttl);
     }
 
-    int64_t crl_ttl_seconds(const std::vector<uint8_t>& der) {
-        const unsigned char* p = der.data();
-        X509_CRL* crl = d2i_X509_CRL(nullptr, &p, static_cast<long>(der.size()));
+    int64_t crl_ttl_seconds(std::vector<uint8_t> const& der) {
+        unsigned char const* p = der.data();
+        X509_CRL* crl =
+            d2i_X509_CRL(nullptr, &p, static_cast<long>(der.size()));
         if (crl == nullptr) {
             return clamp_crl_ttl(config.default_crl_ttl_seconds);
         }
         int64_t ttl = config.default_crl_ttl_seconds;
-        const ASN1_TIME* next_update = X509_CRL_get0_nextUpdate(crl);
+        ASN1_TIME const* next_update = X509_CRL_get0_nextUpdate(crl);
         if (next_update != nullptr) {
             auto parsed = asn1_time_to_unix(next_update);
             if (parsed) {
                 int64_t seconds_from_now = *parsed - now_seconds();
-                if (seconds_from_now > 0) ttl = seconds_from_now;
+                if (seconds_from_now > 0) {
+                    ttl = seconds_from_now;
+                }
             }
         }
         X509_CRL_free(crl);
@@ -1223,12 +1422,18 @@ private:
         return std::min(ttl, static_cast<int64_t>(config.max_crl_ttl_seconds));
     }
 
-    static std::optional<int64_t> asn1_time_to_unix(const ASN1_TIME* t) {
-        if (t == nullptr) return std::nullopt;
-        struct tm tm_val{};
-        if (ASN1_TIME_to_tm(t, &tm_val) != 1) return std::nullopt;
+    static std::optional<int64_t> asn1_time_to_unix(ASN1_TIME const* t) {
+        if (t == nullptr) {
+            return std::nullopt;
+        }
+        struct tm tm_val {};
+        if (ASN1_TIME_to_tm(t, &tm_val) != 1) {
+            return std::nullopt;
+        }
         time_t result = timegm(&tm_val);
-        if (result == static_cast<time_t>(-1)) return std::nullopt;
+        if (result == static_cast<time_t>(-1)) {
+            return std::nullopt;
+        }
         return static_cast<int64_t>(result);
     }
 
@@ -1257,29 +1462,36 @@ private:
     // ровно один сертификат в чистом DER, независимо от того, как он был
     // упакован в HTTP-ответе.
     static std::optional<std::vector<uint8_t>> extract_single_der_certificate(
-        const std::vector<uint8_t>& payload) {
-        if (payload.empty()) return std::nullopt;
+        std::vector<uint8_t> const& payload) {
+        if (payload.empty()) {
+            return std::nullopt;
+        }
 
         // Случай 1 (наиболее распространённый): голый DER X.509 как есть.
         {
-            const unsigned char* p = payload.data();
-            X509* cert = d2i_X509(nullptr, &p, static_cast<long>(payload.size()));
+            unsigned char const* p = payload.data();
+            X509* cert =
+                d2i_X509(nullptr, &p, static_cast<long>(payload.size()));
             if (cert != nullptr) {
                 X509_free(cert);
-                return payload; // уже в нужном виде, повторное кодирование не нужно
+                return payload;  // уже в нужном виде, повторное кодирование не
+                                 // нужно
             }
         }
 
         // Случай 2: PKCS#7 "degenerate" контейнер.
-        const unsigned char* p = payload.data();
+        unsigned char const* p = payload.data();
         PKCS7* p7 = d2i_PKCS7(nullptr, &p, static_cast<long>(payload.size()));
-        if (p7 == nullptr) return std::nullopt;
+        if (p7 == nullptr) {
+            return std::nullopt;
+        }
 
         STACK_OF(X509)* certs = nullptr;
         int nid = OBJ_obj2nid(p7->type);
         if (nid == NID_pkcs7_signed && p7->d.sign != nullptr) {
             certs = p7->d.sign->cert;
-        } else if (nid == NID_pkcs7_signedAndEnveloped && p7->d.signed_and_enveloped != nullptr) {
+        } else if (nid == NID_pkcs7_signedAndEnveloped &&
+                   p7->d.signed_and_enveloped != nullptr) {
             certs = p7->d.signed_and_enveloped->cert;
         }
 
@@ -1288,12 +1500,16 @@ private:
             return std::nullopt;
         }
 
-        X509* chosen = sk_X509_value(certs, 0); // см. комментарий выше про выбор первого
+        X509* chosen =
+            sk_X509_value(certs, 0);  // см. комментарий выше про выбор первого
         unsigned char* der_out = nullptr;
         int der_len = i2d_X509(chosen, &der_out);
-        PKCS7_free(p7); // chosen указывал внутрь p7 — освобождать после i2d, не раньше
+        PKCS7_free(p7);  // chosen указывал внутрь p7 — освобождать после i2d,
+                         // не раньше
 
-        if (der_len <= 0 || der_out == nullptr) return std::nullopt;
+        if (der_len <= 0 || der_out == nullptr) {
+            return std::nullopt;
+        }
         std::vector<uint8_t> result(der_out, der_out + der_len);
         OPENSSL_free(der_out);
         return result;
@@ -1305,11 +1521,14 @@ private:
     // раньше — здесь намеренно разбираем DER повторно, а не протаскиваем
     // X509* наружу: так handle_intermediate_cert_impl() не обязан знать
     // про управление временем жизни OpenSSL-объекта.
-    static std::optional<int64_t> cert_not_after_unix(const std::vector<uint8_t>& der) {
-        const unsigned char* p = der.data();
+    static std::optional<int64_t> cert_not_after_unix(
+        std::vector<uint8_t> const& der) {
+        unsigned char const* p = der.data();
         X509* cert = d2i_X509(nullptr, &p, static_cast<long>(der.size()));
-        if (cert == nullptr) return std::nullopt;
-        const ASN1_TIME* not_after = X509_get0_notAfter(cert);
+        if (cert == nullptr) {
+            return std::nullopt;
+        }
+        ASN1_TIME const* not_after = X509_get0_notAfter(cert);
         auto result = asn1_time_to_unix(not_after);
         X509_free(cert);
         return result;
@@ -1322,8 +1541,12 @@ private:
     // Клампим только сверху (аналогично apply_http_cache_hints выше) —
     // никогда не удлиняем TTL, если notAfter окажется дальше в будущем,
     // чем computed_ttl.
-    int64_t clamp_ttl_to_cert_not_after(int64_t ttl, const std::vector<uint8_t>& cert_der) const {
-        if (ttl <= 0) return ttl; // уже не кэшируем (see apply_http_cache_hints) — клампить нечего
+    int64_t clamp_ttl_to_cert_not_after(
+        int64_t ttl, std::vector<uint8_t> const& cert_der) const {
+        if (ttl <= 0) {
+            return ttl;  // уже не кэшируем (see apply_http_cache_hints) —
+                         // клампить нечего
+        }
 
         auto not_after = cert_not_after_unix(cert_der);
         if (!not_after) {
@@ -1338,7 +1561,9 @@ private:
         }
 
         int64_t remaining = *not_after - now_seconds();
-        if (remaining <= 0) return 0; // сертификат уже просрочен — вообще не кэшировать
+        if (remaining <= 0) {
+            return 0;  // сертификат уже просрочен — вообще не кэшировать
+        }
         return std::min(ttl, remaining);
     }
 
@@ -1352,7 +1577,7 @@ private:
     // daemon_main.cpp (или тестом), как и для http_fetcher/cache_store.
     ldap::ILdapFetcher* ldap_fetcher = nullptr;
     // ROADMAP.md, раздел 4, пункт 23: nullptr — аудит выключен.
-    audit::IAuditSink* audit_sink_ = nullptr;
+    audit::IAuditSink* audit_sink = nullptr;
 
     // Счётчики наблюдаемости по типу запроса (пункт 5 из анализа Squid) —
     // живут с момента старта процесса, не персистентны между рестартами
@@ -1365,16 +1590,17 @@ private:
     // См. singleflight_execute() выше. Отдельная от inflight_ мьютекс:
     // защищает только саму map (поиск/вставку/удаление записей), не
     // выполнение impl_fn() — см. комментарий внутри singleflight_execute.
-    std::mutex inflight_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<InFlightState>> inflight_;
+    std::mutex inflight_mutex;
+    std::unordered_map<std::string, std::shared_ptr<InFlightState>> inflight;
 
     // ROADMAP.md, раздел 2, пункт 11 (P1): circuit breaker per-host. См.
     // подробный комментарий в начале файла. breakers_mutex_ защищает
     // только саму map (тот же принцип, что inflight_mutex_ выше) — сама
     // работа с конкретным CircuitBreakerState синхронизируется его
     // собственным state->mtx.
-    std::mutex breakers_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<CircuitBreakerState>> breakers_;
+    std::mutex breakers_mutex;
+    std::unordered_map<std::string, std::shared_ptr<CircuitBreakerState>>
+        breakers;
 };
 
-} // namespace cert_helper
+}  // namespace cert_helper

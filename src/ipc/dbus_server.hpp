@@ -48,9 +48,12 @@
 // лишние потоки постоянно.
 //
 // Права доступа контролируются не файлом сокета (как было для UDS), а
-// D-Bus policy-файлом на системной шине — см. deploy/org.certhelper.CertHelper1.conf.
+// D-Bus policy-файлом на системной шине — см.
+// deploy/org.certhelper.CertHelper1.conf.
 
 #pragma once
+
+#include <systemd/sd-bus.h>
 
 #include <atomic>
 #include <chrono>
@@ -61,8 +64,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <systemd/sd-bus.h>
 
 #include "../request_router.hpp"
 #include "dbus_interface.hpp"
@@ -77,13 +78,14 @@ public:
         // тестах: приватный dbus-daemon на своём сокете, см.
         // tests/test_client_server_roundtrip.cpp).
         std::string bus_address;
-        std::string well_known_name = kServiceName;
+        std::string well_known_name = SERVICE_NAME;
 
         // Эластичный пул воркеров (пункт 4 из анализа Squid, см. выше).
         int min_worker_threads = 2;
         int max_worker_threads = 16;
-        int worker_idle_timeout_ms = 30000; // после простоя дольше этого — поток завершается,
-                                              // если текущее число воркеров выше min_worker_threads
+        int worker_idle_timeout_ms =
+            30000;  // после простоя дольше этого — поток завершается,
+                    // если текущее число воркеров выше min_worker_threads
     };
 
     DbusServer(Config config, RequestRouter& router);
@@ -105,11 +107,16 @@ public:
     // в анонимном namespace в .cpp — сами обработчики не являются частью
     // публичного API класса в смысловом плане (никто, кроме sd-bus
     // vtable-машинерии, не должен вызывать их напрямую).
-    static int on_fetch_ocsp(sd_bus_message* m, void* userdata, sd_bus_error* ret_error);
-    static int on_fetch_ocsp_batch(sd_bus_message* m, void* userdata, sd_bus_error* ret_error);
-    static int on_fetch_crl(sd_bus_message* m, void* userdata, sd_bus_error* ret_error);
-    static int on_fetch_intermediate_cert(sd_bus_message* m, void* userdata, sd_bus_error* ret_error);
-    static int on_health_check(sd_bus_message* m, void* userdata, sd_bus_error* ret_error);
+    static int on_fetch_ocsp(sd_bus_message* m, void* userdata,
+                             sd_bus_error* ret_error);
+    static int on_fetch_ocsp_batch(sd_bus_message* m, void* userdata,
+                                   sd_bus_error* ret_error);
+    static int on_fetch_crl(sd_bus_message* m, void* userdata,
+                            sd_bus_error* ret_error);
+    static int on_fetch_intermediate_cert(sd_bus_message* m, void* userdata,
+                                          sd_bus_error* ret_error);
+    static int on_health_check(sd_bus_message* m, void* userdata,
+                               sd_bus_error* ret_error);
 
 private:
     struct PendingJob {
@@ -119,7 +126,7 @@ private:
     void bus_loop();
     void worker_loop();
     void enqueue(std::function<void()> job);
-    void maybe_spawn_worker(); // вызывается из enqueue() под queue_mutex
+    void maybe_spawn_worker();  // вызывается из enqueue() под queue_mutex
 
     Config config;
     RequestRouter& router;
@@ -146,4 +153,4 @@ private:
     bool stopping = false;
 };
 
-} // namespace cert_helper::ipc
+}  // namespace cert_helper::ipc

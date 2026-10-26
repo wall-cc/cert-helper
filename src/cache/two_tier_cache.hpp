@@ -51,28 +51,33 @@ class MemoryLruCache {
 public:
     struct Limits {
         uint64_t max_entries = 20000;
-        uint64_t max_size_bytes = 64ull * 1024 * 1024; // 64 МиБ — заметно меньше диска по умолчанию
+        uint64_t max_size_bytes =
+            64ull * 1024 * 1024;  // 64 МиБ — заметно меньше диска по умолчанию
     };
 
     explicit MemoryLruCache(Limits limits) : limits(limits) {}
 
-    std::optional<CacheEntry> get(const std::string& key) {
+    std::optional<CacheEntry> get(std::string const& key) {
         std::lock_guard<std::mutex> lock(mutex);
         auto it = index.find(key);
-        if (it == index.end()) return std::nullopt;
+        if (it == index.end()) {
+            return std::nullopt;
+        }
 
-        if (it->second->entry.valid_until != 0 && now_seconds() >= it->second->entry.valid_until) {
+        if (it->second->entry.valid_until != 0 &&
+            now_seconds() >= it->second->entry.valid_until) {
             total_bytes -= it->second->entry.payload.size();
             list.erase(it->second);
             index.erase(it);
             return std::nullopt;
         }
 
-        list.splice(list.begin(), list, it->second); // переносим в начало (most-recently-used)
+        list.splice(list.begin(), list,
+                    it->second);  // переносим в начало (most-recently-used)
         return it->second->entry;
     }
 
-    void put(const std::string& key, const CacheEntry& entry) {
+    void put(std::string const& key, CacheEntry const& entry) {
         std::lock_guard<std::mutex> lock(mutex);
         auto it = index.find(key);
         if (it != index.end()) {
@@ -111,7 +116,8 @@ private:
     }
 
     void evict_if_needed() {
-        while ((index.size() > limits.max_entries || total_bytes > limits.max_size_bytes) &&
+        while ((index.size() > limits.max_entries ||
+                total_bytes > limits.max_size_bytes) &&
                !list.empty()) {
             auto& back = list.back();
             total_bytes -= back.entry.payload.size();
@@ -122,7 +128,8 @@ private:
 
     Limits limits;
     mutable std::mutex mutex;
-    std::list<Node> list; // front = most recently used, back = least recently used
+    std::list<Node>
+        list;  // front = most recently used, back = least recently used
     std::unordered_map<std::string, std::list<Node>::iterator> index;
     uint64_t total_bytes = 0;
 };
@@ -133,10 +140,12 @@ private:
 // интерфейс).
 class TwoTierCacheStore : public ICacheStore {
 public:
-    TwoTierCacheStore(ICacheStore& persistent_backend, MemoryLruCache::Limits memory_limits)
+    TwoTierCacheStore(ICacheStore& persistent_backend,
+                      MemoryLruCache::Limits memory_limits)
         : backend(persistent_backend), memory(memory_limits) {}
 
-    std::optional<CacheEntry> get(EntryKind kind, const std::string& key) override {
+    std::optional<CacheEntry> get(EntryKind kind,
+                                  std::string const& key) override {
         std::string composite = make_key(kind, key);
 
         if (auto hit = memory.get(composite)) {
@@ -145,12 +154,13 @@ public:
 
         auto disk_hit = backend.get(kind, key);
         if (disk_hit) {
-            memory.put(composite, *disk_hit); // прогреваем память на чтении
+            memory.put(composite, *disk_hit);  // прогреваем память на чтении
         }
         return disk_hit;
     }
 
-    void put(EntryKind kind, const std::string& key, const CacheEntry& entry) override {
+    void put(EntryKind kind, std::string const& key,
+             CacheEntry const& entry) override {
         // Персистентный бэкенд — источник истины, пишем в него первым;
         // если он почему-то не смог сохранить (например, файловая
         // система недоступна для записи — FileCacheStore в этом случае
@@ -162,14 +172,16 @@ public:
     }
 
     CacheStats stats() override {
-        CacheStats stats = backend.stats(); // entries/size_bytes — из персистентного слоя (источник истины)
+        CacheStats stats =
+            backend.stats();  // entries/size_bytes — из персистентного слоя
+                              // (источник истины)
         stats.memory_entries = memory.size();
         stats.memory_size_bytes = memory.size_bytes();
         return stats;
     }
 
 private:
-    static std::string make_key(EntryKind kind, const std::string& key) {
+    static std::string make_key(EntryKind kind, std::string const& key) {
         return std::to_string(static_cast<int>(kind)) + "|" + key;
     }
 
@@ -177,4 +189,4 @@ private:
     MemoryLruCache memory;
 };
 
-} // namespace cert_helper::cache
+}  // namespace cert_helper::cache

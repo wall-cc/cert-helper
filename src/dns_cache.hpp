@@ -30,20 +30,20 @@
 
 #pragma once
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <mutex>
-#include <netdb.h>
 #include <string>
-#include <sys/socket.h>
 #include <unordered_map>
 #include <vector>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
 
 namespace cert_helper::net {
 
@@ -52,15 +52,15 @@ namespace cert_helper::net {
 // резолв хоста может использоваться для разных портов: например, OCSP
 // responder на 80 и CDP на 8080 одного и того же хоста).
 struct ResolvedAddress {
-    int family = AF_INET; // AF_INET или AF_INET6
-    std::array<uint8_t, 16> bytes{}; // 4 байта для AF_INET, 16 для AF_INET6
+    int family = AF_INET;             // AF_INET или AF_INET6
+    std::array<uint8_t, 16> bytes{};  // 4 байта для AF_INET, 16 для AF_INET6
 };
 
 // Собирает sockaddr_storage для данного ResolvedAddress + порта — общий
 // хелпер, чтобы http_client.hpp/ldap_client.hpp не дублировали разбор
 // AF_INET/AF_INET6 каждый у себя.
-inline void make_sockaddr(const ResolvedAddress& addr, uint16_t port, struct sockaddr_storage& out,
-                           socklen_t& out_len) {
+inline void make_sockaddr(ResolvedAddress const& addr, uint16_t port,
+                          struct sockaddr_storage& out, socklen_t& out_len) {
     std::memset(&out, 0, sizeof(out));
     if (addr.family == AF_INET6) {
         auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(&out);
@@ -85,10 +85,12 @@ public:
     // истечение TTL) без зависимости от реальной DNS/сети — тот же
     // interface-based подход к тестируемости, что и у IHttpFetcher/
     // ICacheStore/ILdapFetcher в остальном проекте.
-    using ResolverFn = std::function<std::vector<ResolvedAddress>(const std::string&)>;
+    using ResolverFn =
+        std::function<std::vector<ResolvedAddress>(std::string const&)>;
 
-    explicit DnsCache(uint32_t ttl_seconds = 60, ResolverFn resolver = default_resolver)
-        : ttl_seconds_(ttl_seconds), resolver_(std::move(resolver)) {}
+    explicit DnsCache(uint32_t ttl_seconds = 60,
+                      ResolverFn resolver = default_resolver)
+        : ttl_seconds(ttl_seconds), resolver(std::move(resolver)) {}
 
     // Возвращает список IP-адресов для host: из кэша, если запись ещё не
     // устарела, иначе выполняет резолвинг через resolver_ и (при успехе)
@@ -96,31 +98,35 @@ public:
     // кэшируется — следующий вызов сразу попробует резолвить заново, а
     // не будет ждать TTL после сбоя (транзиентный сбой резолвера не
     // должен блокировать все последующие попытки на целый TTL).
-    std::vector<ResolvedAddress> resolve(const std::string& host) {
+    std::vector<ResolvedAddress> resolve(std::string const& host) {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = cache_.find(host);
-            if (it != cache_.end() && std::chrono::steady_clock::now() < it->second.expires_at) {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = cache.find(host);
+            if (it != cache.end() &&
+                std::chrono::steady_clock::now() < it->second.expires_at) {
                 return it->second.addresses;
             }
         }
 
-        auto resolved = resolver_(host);
+        auto resolved = resolver(host);
         if (!resolved.empty()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cache_[host] = CacheEntry{resolved, std::chrono::steady_clock::now() +
-                                                     std::chrono::seconds(ttl_seconds_)};
+            std::lock_guard<std::mutex> lock(mutex);
+            cache[host] =
+                CacheEntry{resolved, std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(ttl_seconds)};
         }
         return resolved;
     }
 
-    static std::vector<ResolvedAddress> default_resolver(const std::string& host) {
+    static std::vector<ResolvedAddress> default_resolver(
+        std::string const& host) {
         std::vector<ResolvedAddress> out;
-        struct addrinfo hints{};
+        struct addrinfo hints {};
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         struct addrinfo* res = nullptr;
-        if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+        if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 ||
+            res == nullptr) {
             return out;
         }
         for (struct addrinfo* rp = res; rp != nullptr; rp = rp->ai_next) {
@@ -131,10 +137,12 @@ public:
                 std::memcpy(addr.bytes.data(), &sin->sin_addr, 4);
             } else if (rp->ai_family == AF_INET6) {
                 addr.family = AF_INET6;
-                auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(rp->ai_addr);
+                auto* sin6 =
+                    reinterpret_cast<struct sockaddr_in6*>(rp->ai_addr);
                 std::memcpy(addr.bytes.data(), &sin6->sin6_addr, 16);
             } else {
-                continue; // ни IPv4, ни IPv6 — пропускаем (не наш случай на практике)
+                continue;  // ни IPv4, ни IPv6 — пропускаем (не наш случай на
+                           // практике)
             }
             out.push_back(addr);
         }
@@ -148,10 +156,10 @@ private:
         std::chrono::steady_clock::time_point expires_at;
     };
 
-    uint32_t ttl_seconds_;
-    ResolverFn resolver_;
-    std::mutex mutex_;
-    std::unordered_map<std::string, CacheEntry> cache_;
+    uint32_t ttl_seconds;
+    ResolverFn resolver;
+    std::mutex mutex;
+    std::unordered_map<std::string, CacheEntry> cache;
 };
 
-} // namespace cert_helper::net
+}  // namespace cert_helper::net

@@ -30,13 +30,13 @@
 
 #pragma once
 
-#include <optional>
-#include <string>
-#include <vector>
-
 #include <openssl/asn1.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace cert_helper::crl {
 
@@ -49,52 +49,74 @@ namespace detail {
 // GENERAL_NAME-записей типа GEN_URI — как и в aia.hpp, теоретически
 // возможны и другие типы имён (relativeName, DN и т.д.), в проде
 // встречаются только URI, остальные пропускаются, а не считаются ошибкой.
-inline std::optional<std::string> first_uri_from_dist_points(CRL_DIST_POINTS* dist_points) {
-    if (dist_points == nullptr) return std::nullopt;
+inline std::optional<std::string> first_uri_from_dist_points(
+    CRL_DIST_POINTS* dist_points) {
+    if (dist_points == nullptr) {
+        return std::nullopt;
+    }
 
     std::optional<std::string> result;
     int count = sk_DIST_POINT_num(dist_points);
     for (int i = 0; i < count && !result; ++i) {
         DIST_POINT* dp = sk_DIST_POINT_value(dist_points, i);
-        if (dp == nullptr || dp->distpoint == nullptr) continue;
-        if (dp->distpoint->type != 0) continue; // 0 == fullName (GENERAL_NAMES); пропускаем relativeName
+        if (dp == nullptr || dp->distpoint == nullptr) {
+            continue;
+        }
+        if (dp->distpoint->type != 0) {
+            continue;  // 0 == fullName (GENERAL_NAMES); пропускаем relativeName
+        }
         GENERAL_NAMES* names = dp->distpoint->name.fullname;
-        if (names == nullptr) continue;
+        if (names == nullptr) {
+            continue;
+        }
 
         int name_count = sk_GENERAL_NAME_num(names);
         for (int j = 0; j < name_count; ++j) {
             GENERAL_NAME* name = sk_GENERAL_NAME_value(names, j);
-            if (name == nullptr || name->type != GEN_URI) continue;
-            const ASN1_IA5STRING* uri = name->d.uniformResourceIdentifier;
-            if (uri == nullptr || uri->data == nullptr || uri->length <= 0) continue;
-            result = std::string(reinterpret_cast<const char*>(uri->data),
-                                  static_cast<size_t>(uri->length));
+            if (name == nullptr || name->type != GEN_URI) {
+                continue;
+            }
+            ASN1_IA5STRING const* uri = name->d.uniformResourceIdentifier;
+            if (uri == nullptr || uri->data == nullptr || uri->length <= 0) {
+                continue;
+            }
+            result = std::string(reinterpret_cast<char const*>(uri->data),
+                                 static_cast<size_t>(uri->length));
             break;
         }
     }
     return result;
 }
 
-} // namespace detail
+}  // namespace detail
 
 // --- freshestCRL на СЕРТИФИКАТЕ (альтернативное место размещения по RFC
 // 5280 — позволяет обнаружить delta-CRL, не скачивая сначала базовый CRL
 // целиком). ---
-inline std::optional<std::string> extract_freshest_crl_url_from_cert(X509* cert) {
-    if (cert == nullptr) return std::nullopt;
-    auto* dist_points =
-        static_cast<CRL_DIST_POINTS*>(X509_get_ext_d2i(cert, NID_freshest_crl, nullptr, nullptr));
+inline std::optional<std::string> extract_freshest_crl_url_from_cert(
+    X509* cert) {
+    if (cert == nullptr) {
+        return std::nullopt;
+    }
+    auto* dist_points = static_cast<CRL_DIST_POINTS*>(
+        X509_get_ext_d2i(cert, NID_freshest_crl, nullptr, nullptr));
     auto result = detail::first_uri_from_dist_points(dist_points);
-    if (dist_points) sk_DIST_POINT_pop_free(dist_points, DIST_POINT_free);
+    if (dist_points) {
+        sk_DIST_POINT_pop_free(dist_points, DIST_POINT_free);
+    }
     return result;
 }
 
 inline std::optional<std::string> extract_freshest_crl_url_from_cert_der(
-    const std::vector<uint8_t>& cert_der) {
-    if (cert_der.empty()) return std::nullopt;
-    const unsigned char* p = cert_der.data();
+    std::vector<uint8_t> const& cert_der) {
+    if (cert_der.empty()) {
+        return std::nullopt;
+    }
+    unsigned char const* p = cert_der.data();
     X509* cert = d2i_X509(nullptr, &p, static_cast<long>(cert_der.size()));
-    if (cert == nullptr) return std::nullopt;
+    if (cert == nullptr) {
+        return std::nullopt;
+    }
     auto result = extract_freshest_crl_url_from_cert(cert);
     X509_free(cert);
     return result;
@@ -102,21 +124,31 @@ inline std::optional<std::string> extract_freshest_crl_url_from_cert_der(
 
 // --- freshestCRL на самом (полном) CRL — типичное место в реальных PKI:
 // CA публикует его прямо в базовом CRL, который клиент и так скачал. ---
-inline std::optional<std::string> extract_freshest_crl_url_from_crl(X509_CRL* crl) {
-    if (crl == nullptr) return std::nullopt;
+inline std::optional<std::string> extract_freshest_crl_url_from_crl(
+    X509_CRL* crl) {
+    if (crl == nullptr) {
+        return std::nullopt;
+    }
     auto* dist_points = static_cast<CRL_DIST_POINTS*>(
         X509_CRL_get_ext_d2i(crl, NID_freshest_crl, nullptr, nullptr));
     auto result = detail::first_uri_from_dist_points(dist_points);
-    if (dist_points) sk_DIST_POINT_pop_free(dist_points, DIST_POINT_free);
+    if (dist_points) {
+        sk_DIST_POINT_pop_free(dist_points, DIST_POINT_free);
+    }
     return result;
 }
 
 inline std::optional<std::string> extract_freshest_crl_url_from_crl_der(
-    const std::vector<uint8_t>& crl_der) {
-    if (crl_der.empty()) return std::nullopt;
-    const unsigned char* p = crl_der.data();
-    X509_CRL* crl = d2i_X509_CRL(nullptr, &p, static_cast<long>(crl_der.size()));
-    if (crl == nullptr) return std::nullopt;
+    std::vector<uint8_t> const& crl_der) {
+    if (crl_der.empty()) {
+        return std::nullopt;
+    }
+    unsigned char const* p = crl_der.data();
+    X509_CRL* crl =
+        d2i_X509_CRL(nullptr, &p, static_cast<long>(crl_der.size()));
+    if (crl == nullptr) {
+        return std::nullopt;
+    }
     auto result = extract_freshest_crl_url_from_crl(crl);
     X509_CRL_free(crl);
     return result;
@@ -130,26 +162,38 @@ inline std::optional<std::string> extract_freshest_crl_url_from_crl_der(
 // который вызывающей стороне стоит явно проверить перед тем, как
 // применять скачанный CRL как delta поверх уже имеющегося полного.
 inline std::optional<int64_t> extract_delta_crl_base_number(X509_CRL* crl) {
-    if (crl == nullptr) return std::nullopt;
-    auto* base_number =
-        static_cast<ASN1_INTEGER*>(X509_CRL_get_ext_d2i(crl, NID_delta_crl, nullptr, nullptr));
-    if (base_number == nullptr) return std::nullopt;
+    if (crl == nullptr) {
+        return std::nullopt;
+    }
+    auto* base_number = static_cast<ASN1_INTEGER*>(
+        X509_CRL_get_ext_d2i(crl, NID_delta_crl, nullptr, nullptr));
+    if (base_number == nullptr) {
+        return std::nullopt;
+    }
 
     int64_t value = 0;
     bool ok = (ASN1_INTEGER_get_int64(&value, base_number) == 1);
     ASN1_INTEGER_free(base_number);
-    if (!ok) return std::nullopt;
+    if (!ok) {
+        return std::nullopt;
+    }
     return value;
 }
 
-inline std::optional<int64_t> extract_delta_crl_base_number_der(const std::vector<uint8_t>& crl_der) {
-    if (crl_der.empty()) return std::nullopt;
-    const unsigned char* p = crl_der.data();
-    X509_CRL* crl = d2i_X509_CRL(nullptr, &p, static_cast<long>(crl_der.size()));
-    if (crl == nullptr) return std::nullopt;
+inline std::optional<int64_t> extract_delta_crl_base_number_der(
+    std::vector<uint8_t> const& crl_der) {
+    if (crl_der.empty()) {
+        return std::nullopt;
+    }
+    unsigned char const* p = crl_der.data();
+    X509_CRL* crl =
+        d2i_X509_CRL(nullptr, &p, static_cast<long>(crl_der.size()));
+    if (crl == nullptr) {
+        return std::nullopt;
+    }
     auto result = extract_delta_crl_base_number(crl);
     X509_CRL_free(crl);
     return result;
 }
 
-} // namespace cert_helper::crl
+}  // namespace cert_helper::crl

@@ -1,7 +1,8 @@
 // daemon_main.cpp
 //
 // Точка входа демона cert-helper. Читает конфигурацию из аргументов
-// командной строки (через boost::program_options — см. ниже), поднимает
+// командной строки (описание флагов и их разбор вынесены в класс
+// CommandLineOptions — см. command_line_options.hpp), поднимает
 // кэш (диск + опциональный in-memory слой), HTTP-фетчер (с сетевой
 // политикой destination'ов), роутер и D-Bus сервер (эластичный пул
 // воркеров), обрабатывает SIGINT/SIGTERM для штатной остановки (важно
@@ -37,6 +38,8 @@
 //   п.23 — аудит-лог решений о фетче (src/audit_log.hpp): флаги
 //          --audit-log-file/--audit-log-fsync, по умолчанию выключен.
 
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -48,14 +51,11 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>
-
-#include <boost/program_options.hpp>
-
 #include "audit_log.hpp"
 #include "cache/cache_store.hpp"
 #include "cache/two_tier_cache.hpp"
 #include "cache_warmup.hpp"
+#include "command_line_options.hpp"
 #include "http_client.hpp"
 #include "ipc/dbus_server.hpp"
 #include "ldap_client.hpp"
@@ -63,16 +63,7 @@
 #include "net_policy.hpp"
 #include "request_router.hpp"
 
-namespace po = boost::program_options;
-
 namespace {
-
-// boost::program_options переносит строки в --help по количеству БАЙТ,
-// не по числу символов — на кириллице (многобайтовый UTF-8) это может
-// разрезать текст посередине символа и испортить вывод. Явно задаём
-// заведомо большую длину строки, чтобы перенос практически никогда не
-// срабатывал (описания у нас короче ~200 байт).
-constexpr unsigned kHelpLineLength = 4096;
 
 std::atomic<bool>* g_running_flag = nullptr;
 
@@ -82,234 +73,52 @@ void handle_signal(int) {
     }
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
-    std::string bus_address; // пусто = системная шина
-    std::string bus_name;
-    std::string cache_dir;
-    uint64_t max_cache_entries = 0;
-    uint64_t max_cache_bytes = 0;
-    uint64_t mem_cache_max_entries = 0;
-    uint64_t mem_cache_max_bytes = 0;
-    uint32_t aia_ttl_seconds = 0;
-    uint32_t max_ocsp_ttl_seconds = 0;
-    uint32_t max_crl_ttl_seconds = 0;
-    uint32_t max_ocsp_response_bytes = 0;
-    uint32_t max_aia_response_bytes = 0;
-    uint32_t max_crl_response_bytes = 0;
-    uint32_t max_retries = 0;
-    uint32_t retry_base_delay_ms = 0;
-    uint32_t circuit_breaker_failure_threshold = 0;
-    uint32_t circuit_breaker_cooldown_seconds = 0;
-    uint32_t circuit_breaker_max_tracked_hosts = 0;
-    int min_worker_threads = 0;
-    int max_worker_threads = 0;
-    int worker_idle_timeout_ms = 0;
-    bool allow_private_destinations = false;
-    std::vector<std::string> allow_cidrs;
-    std::vector<std::string> deny_cidrs;
-    std::vector<uint16_t> allowed_ports;
-    bool allow_https = false;
-    std::string https_ca_bundle;
-    bool allow_ldap = false;
-    uint32_t dns_cache_ttl_seconds = 0;
-    std::string warmup_file;
-    std::string log_level_arg;
-    std::string log_format_arg;
-    std::string audit_log_file;
-    bool audit_log_fsync = false;
-
-    po::options_description dbus_opts("D-Bus", kHelpLineLength);
-    dbus_opts.add_options()
-        ("bus-address", po::value<std::string>(&bus_address)->default_value(""),
-         "адрес D-Bus для подключения (пусто = системная шина; непустой адрес "
-         "используется в тестах для приватного dbus-daemon)")
-        ("bus-name", po::value<std::string>(&bus_name)->default_value(cert_helper::ipc::kServiceName),
-         "well-known имя, запрашиваемое на шине");
-
-    po::options_description cache_opts("Кэш (диск + опциональный memory-слой, пункт 2)", kHelpLineLength);
-    cache_opts.add_options()
-        ("cache-dir", po::value<std::string>(&cache_dir)->default_value("/var/lib/cert-helper/cache"),
-         "директория персистентного (файлового) кэша")
-        ("max-cache-entries", po::value<uint64_t>(&max_cache_entries)->default_value(100000),
-         "лимит числа записей на диске")
-        ("max-cache-bytes", po::value<uint64_t>(&max_cache_bytes)->default_value(512ull * 1024 * 1024),
-         "лимит суммарного размера на диске, в байтах")
-        ("mem-cache-max-entries", po::value<uint64_t>(&mem_cache_max_entries)->default_value(20000),
-         "лимит записей в memory-слое (0 отключает эффект memory-слоя)")
-        ("mem-cache-max-bytes", po::value<uint64_t>(&mem_cache_max_bytes)->default_value(64ull * 1024 * 1024),
-         "лимит байт в memory-слое")
-        ("aia-ttl-seconds", po::value<uint32_t>(&aia_ttl_seconds)->default_value(7 * 24 * 3600),
-         "базовый TTL кэша для докачанных промежуточных сертификатов (секунды)")
-        ("max-ocsp-ttl-seconds", po::value<uint32_t>(&max_ocsp_ttl_seconds)->default_value(24 * 3600),
-         "верхняя граница TTL OCSP-кэша (секунды) — клампит nextUpdate "
-         "независимо от того, что заявил responder (ROADMAP.md п.2)")
-        ("max-crl-ttl-seconds", po::value<uint32_t>(&max_crl_ttl_seconds)->default_value(7 * 24 * 3600),
-         "верхняя граница TTL CRL-кэша (секунды) — клампит nextUpdate "
-         "независимо от того, что заявил CA (ROADMAP.md п.2)")
-        ("max-ocsp-response-bytes", po::value<uint32_t>(&max_ocsp_response_bytes)->default_value(256 * 1024),
-         "лимит размера тела OCSP-ответа в байтах (ROADMAP.md п.4)")
-        ("max-aia-response-bytes", po::value<uint32_t>(&max_aia_response_bytes)->default_value(256 * 1024),
-         "лимит размера тела ответа AIA (докачанный сертификат) в байтах (ROADMAP.md п.4)")
-        ("max-crl-response-bytes", po::value<uint32_t>(&max_crl_response_bytes)->default_value(16 * 1024 * 1024),
-         "лимит размера тела CRL-ответа в байтах (ROADMAP.md п.4)")
-        ("max-retries", po::value<uint32_t>(&max_retries)->default_value(2),
-         "число ПОВТОРНЫХ попыток при транзиентной сетевой ошибке "
-         "OCSP/CRL/AIA-fetch (не считая исходной попытки; не применяется "
-         "к ldap:// и не применяется к успешным HTTP-ответам с кодом "
-         "ошибки — только к сбоям транспорта). ROADMAP.md п.10")
-        ("retry-base-delay-ms", po::value<uint32_t>(&retry_base_delay_ms)->default_value(100),
-         "базовая задержка (мс) экспоненциального backoff с джиттером "
-         "между повторными попытками (ROADMAP.md п.10)")
-        ("circuit-breaker-failure-threshold",
-         po::value<uint32_t>(&circuit_breaker_failure_threshold)->default_value(5),
-         "число подряд неудачных ЗАПРОСОВ (после исчерпания retry на "
-         "каждый) к одному хосту, после которого breaker открывается и "
-         "начинает отказывать немедленно (ROADMAP.md п.11)")
-        ("circuit-breaker-cooldown-seconds",
-         po::value<uint32_t>(&circuit_breaker_cooldown_seconds)->default_value(30),
-         "время (секунды) в открытом состоянии breaker'а, прежде чем "
-         "пропустить пробный запрос (ROADMAP.md п.11)")
-        ("circuit-breaker-max-tracked-hosts",
-         po::value<uint32_t>(&circuit_breaker_max_tracked_hosts)->default_value(10000),
-         "предел числа одновременно отслеживаемых хостов для circuit "
-         "breaker — защита от неограниченного роста памяти, т.к. хосты "
-         "приходят из потенциально недобросовестных сертификатов "
-         "(ROADMAP.md п.11)");
-
-    po::options_description worker_opts("Пул воркеров (пункт 4)", kHelpLineLength);
-    worker_opts.add_options()
-        ("min-worker-threads", po::value<int>(&min_worker_threads)->default_value(2),
-         "минимальное число воркеров, всегда в строю")
-        ("max-worker-threads", po::value<int>(&max_worker_threads)->default_value(16),
-         "максимальное число воркеров под нагрузкой")
-        ("worker-idle-timeout-ms", po::value<int>(&worker_idle_timeout_ms)->default_value(30000),
-         "простой дольше этого — воркер завершается, если это не опустит "
-         "пул ниже минимума");
-
-    po::options_description net_opts("Сетевая политика для исходящих запросов (пункт 3, SSRF-защита)", kHelpLineLength);
-    net_opts.add_options()
-        ("allow-private-destinations", po::bool_switch(&allow_private_destinations),
-         "отключить блокировку loopback/link-local/private/CGNAT/multicast "
-         "диапазонов по умолчанию")
-        ("allow-cidr", po::value<std::vector<std::string>>(&allow_cidrs)->composing(),
-         "разрешить конкретный CIDR-диапазон явно, в обход deny-списка "
-         "(можно указывать несколько раз)")
-        ("deny-cidr", po::value<std::vector<std::string>>(&deny_cidrs)->composing(),
-         "запретить дополнительный CIDR-диапазон сверх дефолтного "
-         "(можно указывать несколько раз)")
-        ("allowed-ports",
-         po::value<std::vector<uint16_t>>(&allowed_ports)->multitoken()->default_value({80}, "80"),
-         "список разрешённых портов назначения, через пробел "
-         "(например: --allowed-ports 80 8080; при --allow-https не забудьте "
-         "добавить 443)")
-        ("allow-https", po::bool_switch(&allow_https),
-         "разрешить https:// в AIA/OCSP/CDP URL (по умолчанию выключено — "
-         "см. ROADMAP.md п.7 и комментарий в http_client.hpp; не забудьте "
-         "также добавить 443 в --allowed-ports)")
-        ("https-ca-bundle", po::value<std::string>(&https_ca_bundle)->default_value(""),
-         "путь к файлу/директории с доверенными CA для https:// (пусто = "
-         "системный набор корневых сертификатов); действует, только если "
-         "--allow-https")
-        ("allow-ldap", po::bool_switch(&allow_ldap),
-         "разрешить ldap:// в CRL distribution point URL (по умолчанию "
-         "выключено — см. ROADMAP.md п.9 и комментарий в ldap_client.hpp; "
-         "поддерживается только anonymous bind, без TLS, без пустого host "
-         "в URL)")
-        ("dns-cache-ttl-seconds", po::value<uint32_t>(&dns_cache_ttl_seconds)->default_value(60),
-         "TTL (секунды) локального кэша DNS-резолвинга имён из "
-         "AIA/OCSP/CDP URL — короткий фиксированный TTL, т.к. getaddrinfo() "
-         "не отдаёт реальный TTL DNS-записи (ROADMAP.md п.13). Адрес "
-         "всё равно проверяется политикой при КАЖДОМ использовании "
-         "закэшированной записи, не только при первом резолве.")
-        ("warmup-file", po::value<std::string>(&warmup_file)->default_value(""),
-         "путь к файлу прогрева кэша (пусто = прогрев выключен) — "
-         "построчный список crl:<url>/aia:<url>/"
-         "ocsp:<responder_url>:<cert_path>:<issuer_path>, выполняется в "
-         "фоновом потоке сразу после старта D-Bus сервера, не блокируя "
-         "готовность демона (ROADMAP.md п.15, см. cache_warmup.hpp)");
-
-    po::options_description log_opts("Логирование (ROADMAP.md п.22)", kHelpLineLength);
-    log_opts.add_options()
-        ("log-level", po::value<std::string>(&log_level_arg)->default_value("info"),
-         "минимальный уровень записей диагностического лога: debug|info|warn|error")
-        ("log-format", po::value<std::string>(&log_format_arg)->default_value("text"),
-         "формат диагностического лога: text ([время] [уровень] [компонент] сообщение "
-         "key=value), json (JSON Lines) или journald (структурированные поля "
-         "CH_* через sd_journal_send; если журнал недоступен — текстом в stderr)");
-
-    po::options_description audit_opts("Аудит-лог решений о фетче (ROADMAP.md п.23)", kHelpLineLength);
-    audit_opts.add_options()
-        ("audit-log-file", po::value<std::string>(&audit_log_file)->default_value(""),
-         "путь к append-only журналу (JSON Lines): что докачивали, откуда, с каким "
-         "результатом, когда (пусто = аудит выключен). Если файл не удаётся открыть "
-         "при старте — демон не запускается. Формат и гарантии — см. audit_log.hpp")
-        ("audit-log-fsync", po::bool_switch(&audit_log_fsync),
-         "fsync после каждого события аудита (событие переживает крах ОС/питания; "
-         "медленнее). Действует, только если задан --audit-log-file");
-
-    po::options_description visible("cert-helper — вспомогательный демон докачки/проверки сертификатов", kHelpLineLength);
-    visible.add_options()("help,h", "показать эту справку");
-    visible.add(dbus_opts).add(cache_opts).add(worker_opts).add(net_opts).add(log_opts).add(audit_opts);
-
-    po::variables_map vm;
-    try {
-        po::store(po::parse_command_line(argc, argv, visible), vm);
-        po::notify(vm);
-    } catch (const po::error& e) {
-        std::cerr << "cert-helper: " << e.what() << "\n\n" << visible << "\n";
-        return 2;
+    cert_helper::CommandLineOptions options;
+    using ParseStatus = cert_helper::CommandLineOptions::ParseStatus;
+    switch (options.parse(argc, argv)) {
+        case ParseStatus::OK:
+            break;
+        case ParseStatus::HELP_REQUESTED:
+            std::cout << options.help_text() << "\n";
+            return 0;
+        case ParseStatus::INVALID_USAGE:
+            std::cerr << options.error_message();
+            return 2;
     }
-
-    if (vm.count("help")) {
-        std::cout << visible << "\n";
-        return 0;
-    }
+    cert_helper::DaemonSettings const& settings = options.settings();
 
     // Логгер настраиваем первым делом — всё, что ниже, уже пишет через него.
-    // Неверное значение — ошибка использования (как и любой другой
-    // неверный аргумент), поэтому выходим с кодом 2, а не молча берём дефолт.
-    auto parsed_level = cert_helper::log::parse_level(log_level_arg);
-    if (!parsed_level) {
-        std::cerr << "cert-helper: --log-level: неизвестный уровень \"" << log_level_arg
-                  << "\" (ожидается debug|info|warn|error)\n";
-        return 2;
-    }
-    auto parsed_format = cert_helper::log::parse_format(log_format_arg);
-    if (!parsed_format) {
-        std::cerr << "cert-helper: --log-format: неизвестный формат \"" << log_format_arg
-                  << "\" (ожидается text|json|journald)\n";
-        return 2;
-    }
-    cert_helper::log::Logger::instance().set_level(*parsed_level);
-    cert_helper::log::Logger::instance().set_format(*parsed_format);
+    cert_helper::log::Logger::instance().set_level(settings.log_level);
+    cert_helper::log::Logger::instance().set_format(settings.log_format);
     namespace log = cert_helper::log;
-
-    if (min_worker_threads < 1) min_worker_threads = 1;
-    if (max_worker_threads < min_worker_threads) max_worker_threads = min_worker_threads;
 
     // --- Кэш: диск (источник истины) + опциональный memory-слой (пункт 2) ---
     cert_helper::cache::FileCacheStore::Limits disk_limits;
-    disk_limits.max_entries = max_cache_entries;
-    disk_limits.max_size_bytes = max_cache_bytes;
-    cert_helper::cache::FileCacheStore disk_cache(cache_dir, disk_limits);
+    disk_limits.max_entries = settings.max_cache_entries;
+    disk_limits.max_size_bytes = settings.max_cache_bytes;
+    cert_helper::cache::FileCacheStore disk_cache(settings.cache_dir,
+                                                  disk_limits);
 
     cert_helper::cache::MemoryLruCache::Limits mem_limits;
-    mem_limits.max_entries = mem_cache_max_entries;
-    mem_limits.max_size_bytes = mem_cache_max_bytes;
+    mem_limits.max_entries = settings.mem_cache_max_entries;
+    mem_limits.max_size_bytes = settings.mem_cache_max_bytes;
     cert_helper::cache::TwoTierCacheStore cache(disk_cache, mem_limits);
 
     // --- Сетевая политика для исходящих fetch-запросов (пункт 3) ---
     cert_helper::net::NetworkPolicy::Config net_policy_config;
-    net_policy_config.block_private_by_default = !allow_private_destinations;
-    net_policy_config.allow_cidrs = allow_cidrs;
-    net_policy_config.extra_deny_cidrs = deny_cidrs;
-    net_policy_config.allowed_ports = allowed_ports;
+    net_policy_config.block_private_by_default =
+        !settings.allow_private_destinations;
+    net_policy_config.allow_cidrs = settings.allow_cidrs;
+    net_policy_config.extra_deny_cidrs = settings.deny_cidrs;
+    net_policy_config.allowed_ports = settings.allowed_ports;
     cert_helper::net::NetworkPolicy net_policy(net_policy_config);
 
-    cert_helper::http::SimpleHttpFetcher http(net_policy, allow_https, https_ca_bundle,
-                                                dns_cache_ttl_seconds);
+    cert_helper::http::SimpleHttpFetcher http(net_policy, settings.allow_https,
+                                              settings.https_ca_bundle,
+                                              settings.dns_cache_ttl_seconds);
 
     // ROADMAP.md, раздел 1, пункт 9: LDAP-фетчер создаётся, только если
     // явно включён --allow-ldap — та же логика "не тратить время на
@@ -317,25 +126,28 @@ int main(int argc, char** argv) {
     // SimpleHttpFetcher (см. http_client.hpp). unique_ptr вместо
     // std::optional<SimpleLdapFetcher> — RequestRouter хранит указатель
     // (nullable), а не владеет объектом; unique_ptr здесь только
-    // управляет временем жизни в daemon_main().
+    // управляет временем жизни в main().
     std::unique_ptr<cert_helper::ldap::SimpleLdapFetcher> ldap_fetcher;
-    if (allow_ldap) {
-        ldap_fetcher =
-            std::make_unique<cert_helper::ldap::SimpleLdapFetcher>(net_policy, dns_cache_ttl_seconds);
+    if (settings.allow_ldap) {
+        ldap_fetcher = std::make_unique<cert_helper::ldap::SimpleLdapFetcher>(
+            net_policy, settings.dns_cache_ttl_seconds);
     }
 
     cert_helper::RequestRouter::Config router_config;
-    router_config.aia_ttl_seconds = aia_ttl_seconds;
-    router_config.max_ocsp_ttl_seconds = max_ocsp_ttl_seconds;
-    router_config.max_crl_ttl_seconds = max_crl_ttl_seconds;
-    router_config.max_ocsp_response_bytes = max_ocsp_response_bytes;
-    router_config.max_aia_response_bytes = max_aia_response_bytes;
-    router_config.max_crl_response_bytes = max_crl_response_bytes;
-    router_config.max_retries = max_retries;
-    router_config.retry_base_delay_ms = retry_base_delay_ms;
-    router_config.circuit_breaker_failure_threshold = circuit_breaker_failure_threshold;
-    router_config.circuit_breaker_cooldown_seconds = circuit_breaker_cooldown_seconds;
-    router_config.circuit_breaker_max_tracked_hosts = circuit_breaker_max_tracked_hosts;
+    router_config.aia_ttl_seconds = settings.aia_ttl_seconds;
+    router_config.max_ocsp_ttl_seconds = settings.max_ocsp_ttl_seconds;
+    router_config.max_crl_ttl_seconds = settings.max_crl_ttl_seconds;
+    router_config.max_ocsp_response_bytes = settings.max_ocsp_response_bytes;
+    router_config.max_aia_response_bytes = settings.max_aia_response_bytes;
+    router_config.max_crl_response_bytes = settings.max_crl_response_bytes;
+    router_config.max_retries = settings.max_retries;
+    router_config.retry_base_delay_ms = settings.retry_base_delay_ms;
+    router_config.circuit_breaker_failure_threshold =
+        settings.circuit_breaker_failure_threshold;
+    router_config.circuit_breaker_cooldown_seconds =
+        settings.circuit_breaker_cooldown_seconds;
+    router_config.circuit_breaker_max_tracked_hosts =
+        settings.circuit_breaker_max_tracked_hosts;
 
     // ROADMAP.md, раздел 4, пункт 23: аудит-лог создаётся, только если явно
     // задан --audit-log-file. Файл открываем ЗДЕСЬ, до старта D-Bus
@@ -344,28 +156,33 @@ int main(int argc, char** argv) {
     // старте; последующие сбои записи запросы не блокируют — см.
     // "ГАРАНТИИ" в audit_log.hpp).
     std::unique_ptr<cert_helper::audit::FileAuditLog> audit_log;
-    if (!audit_log_file.empty()) {
+    if (!settings.audit_log_file.empty()) {
         cert_helper::audit::FileAuditLog::Options audit_options;
-        audit_options.path = audit_log_file;
-        audit_options.fsync_each_event = audit_log_fsync;
-        audit_log = std::make_unique<cert_helper::audit::FileAuditLog>(audit_options);
+        audit_options.path = settings.audit_log_file;
+        audit_options.fsync_each_event = settings.audit_log_fsync;
+        audit_log =
+            std::make_unique<cert_helper::audit::FileAuditLog>(audit_options);
         std::string audit_error;
         if (!audit_log->open(&audit_error)) {
-            log::error("daemon", "cannot open audit log — refusing to start without requested audit",
-                       {log::field("path", audit_log_file), log::field("error", audit_error)});
+            log::error("daemon",
+                       "cannot open audit log — refusing to start without "
+                       "requested audit",
+                       {log::field("path", settings.audit_log_file),
+                        log::field("error", audit_error)});
             return 1;
         }
     }
 
-    cert_helper::RequestRouter router(cache, http, router_config, ldap_fetcher.get(), audit_log.get());
+    cert_helper::RequestRouter router(cache, http, router_config,
+                                      ldap_fetcher.get(), audit_log.get());
 
     // --- D-Bus сервер: эластичный пул воркеров (пункт 4) ---
     cert_helper::ipc::DbusServer::Config server_config;
-    server_config.bus_address = bus_address;
-    server_config.well_known_name = bus_name;
-    server_config.min_worker_threads = min_worker_threads;
-    server_config.max_worker_threads = max_worker_threads;
-    server_config.worker_idle_timeout_ms = worker_idle_timeout_ms;
+    server_config.bus_address = settings.bus_address;
+    server_config.well_known_name = settings.bus_name;
+    server_config.min_worker_threads = settings.min_worker_threads;
+    server_config.max_worker_threads = settings.max_worker_threads;
+    server_config.worker_idle_timeout_ms = settings.worker_idle_timeout_ms;
     cert_helper::ipc::DbusServer server(server_config, router);
 
     // daemon_start пишем ДО server.start(): воркеры начинают обслуживать
@@ -373,22 +190,34 @@ int main(int argc, char** argv) {
     // граница запуска, а не чей-то фетч.
     if (audit_log) {
         audit_log->record("daemon_start",
-                          {log::field("pid", static_cast<int64_t>(::getpid())), log::field("bus_name", bus_name)});
+                          {log::field("pid", static_cast<int64_t>(::getpid())),
+                           log::field("bus_name", settings.bus_name)});
     }
 
     if (!server.start()) {
-        log::error("daemon", "failed to start D-Bus service", {log::field("bus_name", bus_name)});
-        if (audit_log) audit_log->record("daemon_stop", {log::field("reason", "start_failed")});
+        log::error("daemon", "failed to start D-Bus service",
+                   {log::field("bus_name", settings.bus_name)});
+        if (audit_log) {
+            audit_log->record("daemon_stop",
+                              {log::field("reason", "start_failed")});
+        }
         return 1;
     }
 
     log::info("daemon", "registered on D-Bus",
-              {log::field("bus_name", bus_name),
-               log::field("bus", bus_address.empty() ? std::string("system bus") : bus_address),
-               log::field("min_workers", min_worker_threads), log::field("max_workers", max_worker_threads),
-               log::field("cache_dir", cache_dir),
-               log::field("mem_cache", mem_cache_max_entries == 0 ? "disabled" : "enabled"),
-               log::field("audit_log", audit_log_file.empty() ? std::string("disabled") : audit_log_file)});
+              {log::field("bus_name", settings.bus_name),
+               log::field("bus", settings.bus_address.empty()
+                                     ? std::string("system bus")
+                                     : settings.bus_address),
+               log::field("min_workers", settings.min_worker_threads),
+               log::field("max_workers", settings.max_worker_threads),
+               log::field("cache_dir", settings.cache_dir),
+               log::field("mem_cache", settings.mem_cache_max_entries == 0
+                                           ? "disabled"
+                                           : "enabled"),
+               log::field("audit_log", settings.audit_log_file.empty()
+                                           ? std::string("disabled")
+                                           : settings.audit_log_file)});
 
     // ROADMAP.md, раздел 2, пункт 15 (P3): прогрев кэша — запускается ПОСЛЕ
     // старта D-Bus сервера, в фоновом потоке, чтобы не задерживать
@@ -397,10 +226,11 @@ int main(int argc, char** argv) {
     // означает "прогрев выключен" — ничего не меняется относительно
     // поведения без этого пункта вовсе.
     std::thread warmup_thread;
-    if (!warmup_file.empty()) {
-        warmup_thread = std::thread([&router, warmup_file] {
-            cert_helper::warmup::run(warmup_file, router);
-        });
+    if (!settings.warmup_file.empty()) {
+        warmup_thread =
+            std::thread([&router, warmup_file = settings.warmup_file] {
+                cert_helper::warmup::run(warmup_file, router);
+            });
     }
 
     std::atomic<bool> running{true};
@@ -414,10 +244,14 @@ int main(int argc, char** argv) {
     }
 
     log::info("daemon", "shutting down");
-    if (warmup_thread.joinable()) warmup_thread.join();
+    if (warmup_thread.joinable()) {
+        warmup_thread.join();
+    }
     server.stop();
     // После server.stop(): воркеры уже остановлены, так что daemon_stop —
     // гарантированно последнее событие этого запуска.
-    if (audit_log) audit_log->record("daemon_stop", {log::field("reason", "signal")});
+    if (audit_log) {
+        audit_log->record("daemon_stop", {log::field("reason", "signal")});
+    }
     return 0;
 }

@@ -26,7 +26,7 @@ ResolvedAddress make_addr(uint8_t last_octet) {
 // (в пределах TTL) — попадание, резолвер больше не вызывается.
 void test_second_resolve_within_ttl_is_cache_hit() {
     std::atomic<int> call_count{0};
-    DnsCache cache(/*ttl_seconds=*/60, [&](const std::string&) {
+    DnsCache cache(/*ttl_seconds=*/60, [&](std::string const&) {
         ++call_count;
         return std::vector<ResolvedAddress>{make_addr(1)};
     });
@@ -36,7 +36,8 @@ void test_second_resolve_within_ttl_is_cache_hit() {
     TEST_CHECK_EQ(r1.size(), size_t{1});
 
     auto r2 = cache.resolve("ocsp.example.test");
-    TEST_CHECK_EQ(call_count.load(), 1); // резолвер НЕ вызван повторно — попадание в кэш
+    TEST_CHECK_EQ(call_count.load(),
+                  1);  // резолвер НЕ вызван повторно — попадание в кэш
     TEST_CHECK_EQ(r2.size(), size_t{1});
     TEST_CHECK(r2[0].bytes == r1[0].bytes);
 }
@@ -45,7 +46,7 @@ void test_second_resolve_within_ttl_is_cache_hit() {
 // резолверу — короткий TTL (по умолчанию), а не бессрочное кэширование.
 void test_resolve_after_ttl_expiry_hits_resolver_again() {
     std::atomic<int> call_count{0};
-    DnsCache cache(/*ttl_seconds=*/1, [&](const std::string&) {
+    DnsCache cache(/*ttl_seconds=*/1, [&](std::string const&) {
         ++call_count;
         return std::vector<ResolvedAddress>{make_addr(1)};
     });
@@ -56,7 +57,7 @@ void test_resolve_after_ttl_expiry_hits_resolver_again() {
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 
     cache.resolve("crl.example.test");
-    TEST_CHECK_EQ(call_count.load(), 2); // TTL истёк — резолвинг повторился
+    TEST_CHECK_EQ(call_count.load(), 2);  // TTL истёк — резолвинг повторился
 }
 
 // Неудачный резолв (пустой результат — имитация ошибки DNS) не должен
@@ -65,9 +66,9 @@ void test_resolve_after_ttl_expiry_hits_resolver_again() {
 // последующие попытки на целый TTL.
 void test_failed_resolve_is_not_cached() {
     std::atomic<int> call_count{0};
-    DnsCache cache(/*ttl_seconds=*/60, [&](const std::string&) {
+    DnsCache cache(/*ttl_seconds=*/60, [&](std::string const&) {
         ++call_count;
-        return std::vector<ResolvedAddress>{}; // имитация ошибки DNS
+        return std::vector<ResolvedAddress>{};  // имитация ошибки DNS
     });
 
     auto r1 = cache.resolve("broken.example.test");
@@ -76,7 +77,8 @@ void test_failed_resolve_is_not_cached() {
 
     auto r2 = cache.resolve("broken.example.test");
     TEST_CHECK(r2.empty());
-    TEST_CHECK_EQ(call_count.load(), 2); // не ждали TTL — сразу повторная попытка
+    TEST_CHECK_EQ(call_count.load(),
+                  2);  // не ждали TTL — сразу повторная попытка
 }
 
 // Разные хосты кэшируются независимо — резолв одного не должен влиять на
@@ -84,7 +86,7 @@ void test_failed_resolve_is_not_cached() {
 void test_different_hosts_cached_independently() {
     std::atomic<int> call_count_a{0};
     std::atomic<int> call_count_b{0};
-    DnsCache cache(/*ttl_seconds=*/60, [&](const std::string& host) {
+    DnsCache cache(/*ttl_seconds=*/60, [&](std::string const& host) {
         if (host == "a.example.test") {
             ++call_count_a;
             return std::vector<ResolvedAddress>{make_addr(1)};
@@ -114,7 +116,8 @@ void test_make_sockaddr_builds_correct_ipv4_address() {
     auto* sin = reinterpret_cast<struct sockaddr_in*>(&ss);
     TEST_CHECK_EQ(static_cast<int>(sin->sin_family), AF_INET);
     TEST_CHECK_EQ(static_cast<int>(ntohs(sin->sin_port)), 8080);
-    TEST_CHECK_EQ(static_cast<int>(reinterpret_cast<uint8_t*>(&sin->sin_addr)[3]), 42);
+    TEST_CHECK_EQ(
+        static_cast<int>(reinterpret_cast<uint8_t*>(&sin->sin_addr)[3]), 42);
 }
 
 // default_resolver() — реальный getaddrinfo() — должен как минимум
@@ -127,7 +130,7 @@ void test_default_resolver_resolves_localhost() {
     TEST_CHECK(!addrs.empty());
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     RUN_TEST(test_second_resolve_within_ttl_is_cache_hit);

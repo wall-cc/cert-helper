@@ -25,6 +25,11 @@
 // заново, независимо от do_bind()/do_search() клиента), так что тест
 // остаётся содержательной проверкой протокола, а не тавтологией.
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -33,11 +38,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "../src/ldap_client.hpp"
 #include "../src/net_policy.hpp"
@@ -49,30 +49,34 @@ using namespace cert_helper::net;
 namespace {
 
 enum class Scenario {
-    kSuccess,
-    kBindFails,
-    kSearchNoSuchObject,
-    kSearchEntryWithoutAttr,
-    kMalformedBer,
+    SUCCESS,
+    BIND_FAILS,
+    SEARCH_NO_SUCH_OBJECT,
+    SEARCH_ENTRY_WITHOUT_ATTR,
+    MALFORMED_BER,
 };
 
 class OneShotLdapServer {
 public:
-    OneShotLdapServer(Scenario scenario, std::string attribute_name, std::vector<uint8_t> attribute_value)
-        : scenario_(scenario), attribute_name_(std::move(attribute_name)),
-          attribute_value_(std::move(attribute_value)) {
+    OneShotLdapServer(Scenario scenario, std::string attribute_name,
+                      std::vector<uint8_t> attribute_value)
+        : scenario(scenario),
+          attribute_name(std::move(attribute_name)),
+          attribute_value(std::move(attribute_value)) {
         listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         int opt = 1;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-        struct sockaddr_in addr{};
+        struct sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0;
-        bind(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+        bind(listen_fd, reinterpret_cast<struct sockaddr*>(&addr),
+             sizeof(addr));
 
         socklen_t addr_len = sizeof(addr);
-        getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), &addr_len);
+        getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&addr),
+                    &addr_len);
         listening_port = ntohs(addr.sin_port);
 
         listen(listen_fd, 1);
@@ -81,7 +85,9 @@ public:
     }
 
     ~OneShotLdapServer() {
-        if (server_thread.joinable()) server_thread.join();
+        if (server_thread.joinable()) {
+            server_thread.join();
+        }
         ::close(listen_fd);
     }
 
@@ -92,15 +98,19 @@ private:
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(listen_fd, &read_fds);
-        struct timeval tv{};
+        struct timeval tv {};
         tv.tv_sec = 2;
         int sel = select(listen_fd + 1, &read_fds, nullptr, nullptr, &tv);
-        if (sel <= 0) return;
+        if (sel <= 0) {
+            return;
+        }
 
         int fd = accept(listen_fd, nullptr, nullptr);
-        if (fd < 0) return;
+        if (fd < 0) {
+            return;
+        }
 
-        if (scenario_ == Scenario::kMalformedBer) {
+        if (scenario == Scenario::MALFORMED_BER) {
             std::vector<uint8_t> garbage = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
             ::send(fd, garbage.data(), garbage.size(), 0);
             ::close(fd);
@@ -112,7 +122,7 @@ private:
             ::close(fd);
             return;
         }
-        bool bind_ok = (scenario_ != Scenario::kBindFails);
+        bool bind_ok = (scenario != Scenario::BIND_FAILS);
         auto bind_resp = make_ldap_result_message(1, 0x61, bind_ok ? 0 : 49);
         ::send(fd, bind_resp.data(), bind_resp.size(), 0);
         if (!bind_ok) {
@@ -126,7 +136,7 @@ private:
             return;
         }
 
-        if (scenario_ == Scenario::kSearchNoSuchObject) {
+        if (scenario == Scenario::SEARCH_NO_SUCH_OBJECT) {
             auto done = make_ldap_result_message(2, 0x65, 32);
             ::send(fd, done.data(), done.size(), 0);
             ::close(fd);
@@ -134,9 +144,11 @@ private:
         }
 
         std::string sent_attr_name =
-            (scenario_ == Scenario::kSearchEntryWithoutAttr) ? "someOtherAttribute" : attribute_name_;
-        auto entry =
-            make_search_result_entry(2, "cn=Test,dc=example,dc=test", sent_attr_name, attribute_value_);
+            (scenario == Scenario::SEARCH_ENTRY_WITHOUT_ATTR)
+                ? "someOtherAttribute"
+                : attribute_name;
+        auto entry = make_search_result_entry(2, "cn=Test,dc=example,dc=test",
+                                              sent_attr_name, attribute_value);
         ::send(fd, entry.data(), entry.size(), 0);
         auto done = make_ldap_result_message(2, 0x65, 0);
         ::send(fd, done.data(), done.size(), 0);
@@ -149,43 +161,54 @@ private:
             size_t consumed = 0;
             bool malformed = false;
             auto tlv = ber::try_read_tlv(buffer, 0, consumed, malformed);
-            if (malformed) return std::nullopt;
-            if (tlv) return std::vector<uint8_t>(buffer.begin(), buffer.begin() + consumed);
+            if (malformed) {
+                return std::nullopt;
+            }
+            if (tlv) {
+                return std::vector<uint8_t>(buffer.begin(),
+                                            buffer.begin() + consumed);
+            }
             char chunk[4096];
             ssize_t r = ::recv(fd, chunk, sizeof(chunk), 0);
-            if (r <= 0) return std::nullopt;
+            if (r <= 0) {
+                return std::nullopt;
+            }
             buffer.insert(buffer.end(), chunk, chunk + r);
         }
     }
 
-    static std::vector<uint8_t> make_ldap_result_message(int64_t message_id, uint8_t op_tag,
-                                                            int result_code) {
+    static std::vector<uint8_t> make_ldap_result_message(int64_t message_id,
+                                                         uint8_t op_tag,
+                                                         int result_code) {
         auto op_body = ber::concat({
             ber::encode_enumerated(result_code),
             ber::encode_octet_string(""),
             ber::encode_octet_string(""),
         });
         auto op = ber::encode_tlv(op_tag, op_body);
-        return ber::encode_sequence(ber::concat({ber::encode_integer(message_id), op}));
+        return ber::encode_sequence(
+            ber::concat({ber::encode_integer(message_id), op}));
     }
 
-    static std::vector<uint8_t> make_search_result_entry(int64_t message_id, const std::string& dn,
-                                                            const std::string& attr_name,
-                                                            const std::vector<uint8_t>& attr_value) {
-        auto value_tlv = ber::encode_tlv(ber::kTagOctetString, attr_value);
-        auto vals_set = ber::encode_tlv(ber::kTagSet, value_tlv);
-        auto partial_attr =
-            ber::encode_sequence(ber::concat({ber::encode_octet_string(attr_name), vals_set}));
+    static std::vector<uint8_t> make_search_result_entry(
+        int64_t message_id, std::string const& dn, std::string const& attr_name,
+        std::vector<uint8_t> const& attr_value) {
+        auto value_tlv = ber::encode_tlv(ber::TAG_OCTET_STRING, attr_value);
+        auto vals_set = ber::encode_tlv(ber::TAG_SET, value_tlv);
+        auto partial_attr = ber::encode_sequence(
+            ber::concat({ber::encode_octet_string(attr_name), vals_set}));
         auto attributes_seq = ber::encode_sequence(partial_attr);
-        auto entry_body = ber::concat({ber::encode_octet_string(dn), attributes_seq});
-        constexpr uint8_t kTagSearchResultEntry = 0x64;
-        auto op = ber::encode_tlv(kTagSearchResultEntry, entry_body);
-        return ber::encode_sequence(ber::concat({ber::encode_integer(message_id), op}));
+        auto entry_body =
+            ber::concat({ber::encode_octet_string(dn), attributes_seq});
+        constexpr uint8_t tag_search_result_entry = 0x64;
+        auto op = ber::encode_tlv(tag_search_result_entry, entry_body);
+        return ber::encode_sequence(
+            ber::concat({ber::encode_integer(message_id), op}));
     }
 
-    Scenario scenario_;
-    std::string attribute_name_;
-    std::vector<uint8_t> attribute_value_;
+    Scenario scenario;
+    std::string attribute_name;
+    std::vector<uint8_t> attribute_value;
     int listen_fd = -1;
     uint16_t listening_port = 0;
     std::thread server_thread;
@@ -200,15 +223,20 @@ NetworkPolicy make_permissive_policy(uint16_t port) {
 
 void test_parses_typical_cdp_ldap_url() {
     auto u = parse_ldap_url(
-        "ldap://dc1.example.test:389/CN=CRL1,CN=exampleCA,CN=CDP,CN=Public%20Key%20Services,"
-        "CN=Services,CN=Configuration,DC=example,DC=test?certificateRevocationList;binary");
+        "ldap://dc1.example.test:389/"
+        "CN=CRL1,CN=exampleCA,CN=CDP,CN=Public%20Key%20Services,"
+        "CN=Services,CN=Configuration,DC=example,DC=test?"
+        "certificateRevocationList;binary");
     TEST_CHECK(u.has_value());
-    if (!u) return;
+    if (!u) {
+        return;
+    }
     TEST_CHECK_EQ(u->host, std::string("dc1.example.test"));
     TEST_CHECK_EQ(static_cast<int>(u->port), 389);
     TEST_CHECK(u->dn.find("Public Key Services") != std::string::npos);
     TEST_CHECK_EQ(u->attributes.size(), size_t{1});
-    TEST_CHECK_EQ(u->attributes[0], std::string("certificateRevocationList;binary"));
+    TEST_CHECK_EQ(u->attributes[0],
+                  std::string("certificateRevocationList;binary"));
     TEST_CHECK_EQ(u->filter, std::string("(objectClass=*)"));
 }
 
@@ -216,7 +244,9 @@ void test_rejects_empty_host_url() {
     TEST_CHECK(!parse_ldap_url("ldap:///CN=x,DC=example,DC=test").has_value());
 }
 
-void test_rejects_non_ldap_scheme() { TEST_CHECK(!parse_ldap_url("http://example.test/").has_value()); }
+void test_rejects_non_ldap_scheme() {
+    TEST_CHECK(!parse_ldap_url("http://example.test/").has_value());
+}
 
 void test_filter_rejects_unsupported_constructs() {
     TEST_CHECK(!filter::encode_top_level("(cn>=foo)").has_value());
@@ -227,12 +257,15 @@ void test_filter_rejects_unsupported_constructs() {
 
 void test_fetches_attribute_value_on_success() {
     std::vector<uint8_t> crl_der = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03};
-    OneShotLdapServer server(Scenario::kSuccess, "certificateRevocationList;binary", crl_der);
+    OneShotLdapServer server(Scenario::SUCCESS,
+                             "certificateRevocationList;binary", crl_der);
 
     SimpleLdapFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) +
-                       "/cn=Test,dc=example,dc=test?certificateRevocationList;binary";
-    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000, 1024 * 1024);
+    std::string url =
+        "ldap://127.0.0.1:" + std::to_string(server.port()) +
+        "/cn=Test,dc=example,dc=test?certificateRevocationList;binary";
+    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000,
+                                1024 * 1024);
 
     TEST_CHECK(result.ok);
     TEST_CHECK(result.value == crl_der);
@@ -240,51 +273,64 @@ void test_fetches_attribute_value_on_success() {
 
 void test_attribute_name_matching_is_case_and_option_insensitive() {
     std::vector<uint8_t> crl_der = {0x01, 0x02, 0x03};
-    OneShotLdapServer server(Scenario::kSuccess, "CertificateRevocationList", crl_der);
+    OneShotLdapServer server(Scenario::SUCCESS, "CertificateRevocationList",
+                             crl_der);
 
     SimpleLdapFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) + "/cn=Test,dc=example,dc=test";
-    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000, 1024 * 1024);
+    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) +
+                      "/cn=Test,dc=example,dc=test";
+    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000,
+                                1024 * 1024);
 
     TEST_CHECK(result.ok);
     TEST_CHECK(result.value == crl_der);
 }
 
 void test_bind_failure_results_in_not_ok() {
-    OneShotLdapServer server(Scenario::kBindFails, "certificateRevocationList;binary", {1, 2, 3});
+    OneShotLdapServer server(Scenario::BIND_FAILS,
+                             "certificateRevocationList;binary", {1, 2, 3});
     SimpleLdapFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) + "/cn=Test,dc=example,dc=test";
-    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000, 1024 * 1024);
+    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) +
+                      "/cn=Test,dc=example,dc=test";
+    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000,
+                                1024 * 1024);
     TEST_CHECK(!result.ok);
 }
 
 void test_no_such_object_results_in_not_ok() {
-    OneShotLdapServer server(Scenario::kSearchNoSuchObject, "certificateRevocationList;binary", {});
+    OneShotLdapServer server(Scenario::SEARCH_NO_SUCH_OBJECT,
+                             "certificateRevocationList;binary", {});
     SimpleLdapFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url =
-        "ldap://127.0.0.1:" + std::to_string(server.port()) + "/cn=NoSuchThing,dc=example,dc=test";
-    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000, 1024 * 1024);
+    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) +
+                      "/cn=NoSuchThing,dc=example,dc=test";
+    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000,
+                                1024 * 1024);
     TEST_CHECK(!result.ok);
 }
 
 void test_entry_without_requested_attribute_results_in_not_ok() {
-    OneShotLdapServer server(Scenario::kSearchEntryWithoutAttr, "certificateRevocationList;binary",
-                              {1, 2, 3});
+    OneShotLdapServer server(Scenario::SEARCH_ENTRY_WITHOUT_ATTR,
+                             "certificateRevocationList;binary", {1, 2, 3});
     SimpleLdapFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) + "/cn=Test,dc=example,dc=test";
-    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000, 1024 * 1024);
+    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) +
+                      "/cn=Test,dc=example,dc=test";
+    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000,
+                                1024 * 1024);
     TEST_CHECK(!result.ok);
 }
 
 void test_malformed_ber_from_server_results_in_not_ok() {
-    OneShotLdapServer server(Scenario::kMalformedBer, "certificateRevocationList;binary", {});
+    OneShotLdapServer server(Scenario::MALFORMED_BER,
+                             "certificateRevocationList;binary", {});
     SimpleLdapFetcher fetcher(make_permissive_policy(server.port()));
-    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) + "/cn=Test,dc=example,dc=test";
-    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000, 1024 * 1024);
+    std::string url = "ldap://127.0.0.1:" + std::to_string(server.port()) +
+                      "/cn=Test,dc=example,dc=test";
+    auto result = fetcher.fetch(url, "certificateRevocationList;binary", 2000,
+                                1024 * 1024);
     TEST_CHECK(!result.ok);
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     RUN_TEST(test_parses_typical_cdp_ldap_url);
