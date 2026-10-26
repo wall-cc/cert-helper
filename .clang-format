@@ -1,0 +1,9 @@
+BasedOnStyle: Google
+IndentWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+ConstructorInitializerIndentWidth: 4
+QualifierAlignment: Right
+InsertBraces: true
+ColumnLimit: 80
+NamespaceIndentation: None
