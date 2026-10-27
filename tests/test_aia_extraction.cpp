@@ -12,17 +12,19 @@
 
 namespace {
 
-std::vector<uint8_t> read_file(const std::string& path) {
+std::vector<uint8_t> read_file(std::string const& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         std::fprintf(stderr, "cannot open test fixture: %s\n", path.c_str());
         std::exit(1);
     }
-    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in),
+                                std::istreambuf_iterator<char>());
 }
 
-std::string fixture_path(const std::string& name) {
-    // Тесты запускаются из build-директории — путь относительный к корню репозитория.
+std::string fixture_path(std::string const& name) {
+    // Тесты запускаются из build-директории — путь относительный к корню
+    // репозитория.
     return "../test_certs/" + name;
 }
 
@@ -51,7 +53,7 @@ void test_returns_nullopt_when_aia_has_only_ocsp() {
 void test_handles_malformed_der_gracefully() {
     std::vector<uint8_t> garbage = {0x00, 0x01, 0x02, 0xFF, 0xFE};
     auto url = cert_helper::aia::extract_ca_issuers_url_der(garbage);
-    TEST_CHECK(!url.has_value()); // не должно бросать исключение или падать
+    TEST_CHECK(!url.has_value());  // не должно бросать исключение или падать
 }
 
 void test_handles_empty_input() {
@@ -60,7 +62,7 @@ void test_handles_empty_input() {
     TEST_CHECK(!url.has_value());
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     RUN_TEST(test_extracts_ca_issuers_url_when_present);

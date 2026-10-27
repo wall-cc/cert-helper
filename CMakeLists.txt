@@ -47,6 +47,7 @@ endfunction()
 # ---------------------------------------------------------------------------
 add_executable(cert-helper
     src/daemon_main.cpp
+    src/command_line_options.cpp
     ${CERT_HELPER_DBUS_SERVER_SOURCES}
 )
 cert_helper_target_common(cert-helper)
@@ -98,8 +99,11 @@ if(CERT_HELPER_BUILD_TESTS)
     add_cert_helper_test(test_cache_warmup tests/test_cache_warmup.cpp)
     add_cert_helper_test(test_cache_export tests/test_cache_export.cpp)
     add_cert_helper_test(test_net_policy tests/test_net_policy.cpp)
+    add_cert_helper_test(test_request_router tests/test_request_router.cpp)
     add_cert_helper_test(test_two_tier_cache tests/test_two_tier_cache.cpp)
     add_cert_helper_test(test_http_cache_hints tests/test_http_cache_hints.cpp)
+    add_cert_helper_test(test_http_url_injection tests/test_http_url_injection.cpp)
+    add_cert_helper_test(test_http_chunked tests/test_http_chunked.cpp)
     add_cert_helper_test(test_http_keepalive tests/test_http_keepalive.cpp)
     add_cert_helper_test(test_https_support tests/test_https_support.cpp)
     add_cert_helper_test(test_ldap_support tests/test_ldap_support.cpp)

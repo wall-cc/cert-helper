@@ -21,13 +21,13 @@
 
 #pragma once
 
-#include <optional>
-#include <string>
-#include <vector>
-
 #include <openssl/asn1.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace cert_helper::aia {
 
@@ -37,29 +37,41 @@ namespace cert_helper::aia {
 // теоретически ASN.1 допускает и другие GENERAL_NAME-типы — их мы
 // пропускаем, а не считаем ошибкой парсинга).
 inline std::optional<std::string> extract_ca_issuers_url(X509* cert) {
-    if (cert == nullptr) return std::nullopt;
+    if (cert == nullptr) {
+        return std::nullopt;
+    }
 
     AUTHORITY_INFO_ACCESS* aia = static_cast<AUTHORITY_INFO_ACCESS*>(
         X509_get_ext_d2i(cert, NID_info_access, nullptr, nullptr));
-    if (aia == nullptr) return std::nullopt;
+    if (aia == nullptr) {
+        return std::nullopt;
+    }
 
     std::optional<std::string> result;
     int count = sk_ACCESS_DESCRIPTION_num(aia);
     for (int i = 0; i < count; ++i) {
         ACCESS_DESCRIPTION* ad = sk_ACCESS_DESCRIPTION_value(aia, i);
-        if (ad == nullptr || ad->method == nullptr || ad->location == nullptr) continue;
+        if (ad == nullptr || ad->method == nullptr || ad->location == nullptr) {
+            continue;
+        }
 
-        if (OBJ_obj2nid(ad->method) != NID_ad_ca_issuers) continue;
-        if (ad->location->type != GEN_URI) continue;
+        if (OBJ_obj2nid(ad->method) != NID_ad_ca_issuers) {
+            continue;
+        }
+        if (ad->location->type != GEN_URI) {
+            continue;
+        }
 
-        const ASN1_IA5STRING* uri = ad->location->d.uniformResourceIdentifier;
-        if (uri == nullptr || uri->data == nullptr || uri->length <= 0) continue;
+        ASN1_IA5STRING const* uri = ad->location->d.uniformResourceIdentifier;
+        if (uri == nullptr || uri->data == nullptr || uri->length <= 0) {
+            continue;
+        }
 
-        result = std::string(reinterpret_cast<const char*>(uri->data),
-                              static_cast<size_t>(uri->length));
-        break; // берём первый — если понадобится fallback на несколько
-               // caIssuers-записей, это расширение интерфейса, не сейчас
-               // (YAGNI, см. открытый вопрос №6 ТЗ)
+        result = std::string(reinterpret_cast<char const*>(uri->data),
+                             static_cast<size_t>(uri->length));
+        break;  // берём первый — если понадобится fallback на несколько
+                // caIssuers-записей, это расширение интерфейса, не сейчас
+                // (YAGNI, см. открытый вопрос №6 ТЗ)
     }
 
     AUTHORITY_INFO_ACCESS_free(aia);
@@ -67,14 +79,19 @@ inline std::optional<std::string> extract_ca_issuers_url(X509* cert) {
 }
 
 // Удобный вариант поверх DER-байт (то, что реально ходит по проводу/из кэша).
-inline std::optional<std::string> extract_ca_issuers_url_der(const std::vector<uint8_t>& cert_der) {
-    if (cert_der.empty()) return std::nullopt;
-    const unsigned char* p = cert_der.data();
+inline std::optional<std::string> extract_ca_issuers_url_der(
+    std::vector<uint8_t> const& cert_der) {
+    if (cert_der.empty()) {
+        return std::nullopt;
+    }
+    unsigned char const* p = cert_der.data();
     X509* cert = d2i_X509(nullptr, &p, static_cast<long>(cert_der.size()));
-    if (cert == nullptr) return std::nullopt;
+    if (cert == nullptr) {
+        return std::nullopt;
+    }
     auto result = extract_ca_issuers_url(cert);
     X509_free(cert);
     return result;
 }
 
-} // namespace cert_helper::aia
+}  // namespace cert_helper::aia

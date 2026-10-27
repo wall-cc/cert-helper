@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <systemd/sd-bus.h>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -24,10 +26,8 @@
 #include <string>
 #include <vector>
 
-#include <systemd/sd-bus.h>
-
-#include "../ipc/dbus_interface.hpp"
 #include "../../include/cert_helper/protocol.hpp"
+#include "../ipc/dbus_interface.hpp"
 
 namespace cert_helper::client_impl {
 
@@ -35,14 +35,15 @@ namespace proto = cert_helper::protocol;
 
 class DbusClientError : public std::runtime_error {
 public:
-    explicit DbusClientError(const std::string& what) : std::runtime_error(what) {}
+    explicit DbusClientError(std::string const& what)
+        : std::runtime_error(what) {}
 };
 
 class DbusClient {
 public:
     // ВАЖНО (контракт исключений): ни один из публичных методов этого
     // класса не бросает наружу DbusClientError — сбой подключения к шине
-    // трактуется как обычная сетевая ошибка (FetchStatus::NetworkError /
+    // трактуется как обычная сетевая ошибка (FetchStatus::NETWORK_ERROR /
     // HealthResult::reachable=false), а не как исключительная ситуация.
     // Это соответствует контракту tls_mitm::OcspFetcher/CrlFetcher выше
     // по стеку (client.hpp): вызывающая сторона (handshake в tls-mitm) не
@@ -51,33 +52,44 @@ public:
     // bus_address пустой => системная шина (sd_bus_open_system). Непустой
     // => подключение к указанному адресу (используется в тестах —
     // приватный dbus-daemon на своём сокете).
-    explicit DbusClient(std::string bus_address = {}) : bus_address(std::move(bus_address)) {}
+    explicit DbusClient(std::string bus_address = {})
+        : bus_address(std::move(bus_address)) {}
 
     ~DbusClient() {
-        if (bus != nullptr) sd_bus_unref(bus);
+        if (bus != nullptr) {
+            sd_bus_unref(bus);
+        }
     }
 
-    DbusClient(const DbusClient&) = delete;
-    DbusClient& operator=(const DbusClient&) = delete;
+    DbusClient(DbusClient const&) = delete;
+    DbusClient& operator=(DbusClient const&) = delete;
 
-    proto::FetchResponse fetch_ocsp(const std::string& responder_url,
-                                     const std::vector<uint8_t>& request_der, uint32_t timeout_ms) {
+    proto::FetchResponse fetch_ocsp(std::string const& responder_url,
+                                    std::vector<uint8_t> const& request_der,
+                                    uint32_t timeout_ms) {
         proto::FetchResponse failure;
-        failure.status = proto::FetchStatus::NetworkError;
+        failure.status = proto::FetchStatus::NETWORK_ERROR;
         try {
             ensure_connected();
-        } catch (const DbusClientError&) {
-            return failure; // шина недоступна — тот же контракт, что и у router'а на сетевую ошибку
+        } catch (DbusClientError const&) {
+            return failure;  // шина недоступна — тот же контракт, что и у
+                             // router'а на сетевую ошибку
         }
         sd_bus_message* msg = nullptr;
-        int r = sd_bus_message_new_method_call(bus, &msg, ipc::kServiceName, ipc::kObjectPath,
-                                                ipc::kInterfaceName, ipc::kMethodFetchOcsp);
-        if (r >= 0) r = sd_bus_message_append(msg, "s", responder_url.c_str());
+        int r = sd_bus_message_new_method_call(
+            bus, &msg, ipc::SERVICE_NAME, ipc::OBJECT_PATH, ipc::INTERFACE_NAME,
+            ipc::METHOD_FETCH_OCSP);
         if (r >= 0) {
-            const void* data = request_der.empty() ? nullptr : request_der.data();
+            r = sd_bus_message_append(msg, "s", responder_url.c_str());
+        }
+        if (r >= 0) {
+            void const* data =
+                request_der.empty() ? nullptr : request_der.data();
             r = sd_bus_message_append_array(msg, 'y', data, request_der.size());
         }
-        if (r >= 0) r = sd_bus_message_append(msg, "u", timeout_ms);
+        if (r >= 0) {
+            r = sd_bus_message_append(msg, "u", timeout_ms);
+        }
         return call_and_parse_fetch(r, msg, timeout_ms);
     }
 
@@ -90,47 +102,69 @@ public:
     // канала связи одинакова для всех, кто через него общался", что и у
     // одиночных fetch_*.
     std::vector<proto::FetchResponse> fetch_ocsp_batch(
-        const std::vector<proto::FetchOcspRequest>& requests, uint32_t timeout_ms) {
+        std::vector<proto::FetchOcspRequest> const& requests,
+        uint32_t timeout_ms) {
         auto failure_for_all = [&] {
             proto::FetchResponse failure;
-            failure.status = proto::FetchStatus::NetworkError;
+            failure.status = proto::FetchStatus::NETWORK_ERROR;
             return std::vector<proto::FetchResponse>(requests.size(), failure);
         };
 
         try {
             ensure_connected();
-        } catch (const DbusClientError&) {
+        } catch (DbusClientError const&) {
             return failure_for_all();
         }
 
         sd_bus_message* msg = nullptr;
-        int r = sd_bus_message_new_method_call(bus, &msg, ipc::kServiceName, ipc::kObjectPath,
-                                                ipc::kInterfaceName, ipc::kMethodFetchOcspBatch);
-        if (r >= 0) r = sd_bus_message_open_container(msg, SD_BUS_TYPE_ARRAY, "(sayu)");
+        int r = sd_bus_message_new_method_call(
+            bus, &msg, ipc::SERVICE_NAME, ipc::OBJECT_PATH, ipc::INTERFACE_NAME,
+            ipc::METHOD_FETCH_OCSP_BATCH);
         if (r >= 0) {
-            for (const auto& req : requests) {
-                r = sd_bus_message_open_container(msg, SD_BUS_TYPE_STRUCT, "sayu");
-                if (r < 0) break;
+            r = sd_bus_message_open_container(msg, SD_BUS_TYPE_ARRAY, "(sayu)");
+        }
+        if (r >= 0) {
+            for (auto const& req : requests) {
+                r = sd_bus_message_open_container(msg, SD_BUS_TYPE_STRUCT,
+                                                  "sayu");
+                if (r < 0) {
+                    break;
+                }
                 r = sd_bus_message_append(msg, "s", req.responder_url.c_str());
                 if (r >= 0) {
-                    const void* data = req.request_der.empty() ? nullptr : req.request_der.data();
-                    r = sd_bus_message_append_array(msg, 'y', data, req.request_der.size());
+                    void const* data = req.request_der.empty()
+                                           ? nullptr
+                                           : req.request_der.data();
+                    r = sd_bus_message_append_array(msg, 'y', data,
+                                                    req.request_der.size());
                 }
-                if (r >= 0) r = sd_bus_message_append(msg, "u", req.timeout_ms);
-                if (r >= 0) r = sd_bus_message_close_container(msg); // закрывает этот STRUCT
-                if (r < 0) break;
+                if (r >= 0) {
+                    r = sd_bus_message_append(msg, "u", req.timeout_ms);
+                }
+                if (r >= 0) {
+                    r = sd_bus_message_close_container(
+                        msg);  // закрывает этот STRUCT
+                }
+                if (r < 0) {
+                    break;
+                }
             }
         }
-        if (r >= 0) r = sd_bus_message_close_container(msg); // закрывает ARRAY
+        if (r >= 0) {
+            r = sd_bus_message_close_container(msg);  // закрывает ARRAY
+        }
 
         if (r < 0) {
-            if (msg != nullptr) sd_bus_message_unref(msg);
+            if (msg != nullptr) {
+                sd_bus_message_unref(msg);
+            }
             return failure_for_all();
         }
 
         sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus_message* reply = nullptr;
-        r = sd_bus_call(bus, msg, timeout_ms_to_usec(timeout_ms), &error, &reply);
+        r = sd_bus_call(bus, msg, timeout_ms_to_usec(timeout_ms), &error,
+                        &reply);
         sd_bus_message_unref(msg);
         sd_bus_error_free(&error);
         if (r < 0) {
@@ -145,21 +179,30 @@ public:
         }
 
         while (true) {
-            r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_STRUCT, "yayb");
+            r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_STRUCT,
+                                               "yayb");
             if (r < 0) {
                 sd_bus_message_unref(reply);
                 return failure_for_all();
             }
-            if (r == 0) break; // элементы кончились
+            if (r == 0) {
+                break;  // элементы кончились
+            }
 
-            uint8_t status_byte = static_cast<uint8_t>(proto::FetchStatus::InvalidResponse);
-            const void* payload_ptr = nullptr;
+            uint8_t status_byte =
+                static_cast<uint8_t>(proto::FetchStatus::INVALID_RESPONSE);
+            void const* payload_ptr = nullptr;
             size_t payload_len = 0;
             int from_cache_int = 0;
 
             r = sd_bus_message_read(reply, "y", &status_byte);
-            if (r >= 0) r = sd_bus_message_read_array(reply, 'y', &payload_ptr, &payload_len);
-            if (r >= 0) r = sd_bus_message_read(reply, "b", &from_cache_int);
+            if (r >= 0) {
+                r = sd_bus_message_read_array(reply, 'y', &payload_ptr,
+                                              &payload_len);
+            }
+            if (r >= 0) {
+                r = sd_bus_message_read(reply, "b", &from_cache_int);
+            }
 
             proto::FetchResponse resp;
             if (r >= 0) {
@@ -168,23 +211,25 @@ public:
                 // тот же риск use-after-free на указателе внутрь буфера
                 // sd_bus_message.
                 if (payload_len > 0) {
-                    resp.payload_der.assign(static_cast<const uint8_t*>(payload_ptr),
-                                             static_cast<const uint8_t*>(payload_ptr) + payload_len);
+                    resp.payload_der.assign(
+                        static_cast<uint8_t const*>(payload_ptr),
+                        static_cast<uint8_t const*>(payload_ptr) + payload_len);
                 }
                 resp.status = static_cast<proto::FetchStatus>(status_byte);
                 resp.from_cache = from_cache_int != 0;
             } else {
-                resp.status = proto::FetchStatus::InvalidResponse;
+                resp.status = proto::FetchStatus::INVALID_RESPONSE;
             }
             results.push_back(std::move(resp));
 
-            r = sd_bus_message_exit_container(reply); // закрывает STRUCT этого элемента
+            r = sd_bus_message_exit_container(
+                reply);  // закрывает STRUCT этого элемента
             if (r < 0) {
                 sd_bus_message_unref(reply);
                 return failure_for_all();
             }
         }
-        sd_bus_message_exit_container(reply); // закрывает ARRAY
+        sd_bus_message_exit_container(reply);  // закрывает ARRAY
         sd_bus_message_unref(reply);
 
         // Контракт с вызывающей стороной (RequestRouter): один элемент
@@ -199,35 +244,47 @@ public:
         return results;
     }
 
-    proto::FetchResponse fetch_crl(const std::string& distribution_point_url, uint32_t timeout_ms) {
+    proto::FetchResponse fetch_crl(std::string const& distribution_point_url,
+                                   uint32_t timeout_ms) {
         proto::FetchResponse failure;
-        failure.status = proto::FetchStatus::NetworkError;
+        failure.status = proto::FetchStatus::NETWORK_ERROR;
         try {
             ensure_connected();
-        } catch (const DbusClientError&) {
+        } catch (DbusClientError const&) {
             return failure;
         }
         sd_bus_message* msg = nullptr;
-        int r = sd_bus_message_new_method_call(bus, &msg, ipc::kServiceName, ipc::kObjectPath,
-                                                ipc::kInterfaceName, ipc::kMethodFetchCrl);
-        if (r >= 0) r = sd_bus_message_append(msg, "s", distribution_point_url.c_str());
-        if (r >= 0) r = sd_bus_message_append(msg, "u", timeout_ms);
+        int r = sd_bus_message_new_method_call(
+            bus, &msg, ipc::SERVICE_NAME, ipc::OBJECT_PATH, ipc::INTERFACE_NAME,
+            ipc::METHOD_FETCH_CRL);
+        if (r >= 0) {
+            r = sd_bus_message_append(msg, "s", distribution_point_url.c_str());
+        }
+        if (r >= 0) {
+            r = sd_bus_message_append(msg, "u", timeout_ms);
+        }
         return call_and_parse_fetch(r, msg, timeout_ms);
     }
 
-    proto::FetchResponse fetch_intermediate_cert(const std::string& aia_url, uint32_t timeout_ms) {
+    proto::FetchResponse fetch_intermediate_cert(std::string const& aia_url,
+                                                 uint32_t timeout_ms) {
         proto::FetchResponse failure;
-        failure.status = proto::FetchStatus::NetworkError;
+        failure.status = proto::FetchStatus::NETWORK_ERROR;
         try {
             ensure_connected();
-        } catch (const DbusClientError&) {
+        } catch (DbusClientError const&) {
             return failure;
         }
         sd_bus_message* msg = nullptr;
-        int r = sd_bus_message_new_method_call(bus, &msg, ipc::kServiceName, ipc::kObjectPath,
-                                                ipc::kInterfaceName, ipc::kMethodFetchIntermediateCert);
-        if (r >= 0) r = sd_bus_message_append(msg, "s", aia_url.c_str());
-        if (r >= 0) r = sd_bus_message_append(msg, "u", timeout_ms);
+        int r = sd_bus_message_new_method_call(
+            bus, &msg, ipc::SERVICE_NAME, ipc::OBJECT_PATH, ipc::INTERFACE_NAME,
+            ipc::METHOD_FETCH_INTERMEDIATE_CERT);
+        if (r >= 0) {
+            r = sd_bus_message_append(msg, "s", aia_url.c_str());
+        }
+        if (r >= 0) {
+            r = sd_bus_message_append(msg, "u", timeout_ms);
+        }
         return call_and_parse_fetch(r, msg, timeout_ms);
     }
 
@@ -240,21 +297,27 @@ public:
         HealthResult result;
         try {
             ensure_connected();
-        } catch (const DbusClientError&) {
-            return result; // reachable остаётся false
+        } catch (DbusClientError const&) {
+            return result;  // reachable остаётся false
         }
 
         sd_bus_message* msg = nullptr;
-        int r = sd_bus_message_new_method_call(bus, &msg, ipc::kServiceName, ipc::kObjectPath,
-                                                ipc::kInterfaceName, ipc::kMethodHealthCheck);
-        if (r < 0) return result;
+        int r = sd_bus_message_new_method_call(
+            bus, &msg, ipc::SERVICE_NAME, ipc::OBJECT_PATH, ipc::INTERFACE_NAME,
+            ipc::METHOD_HEALTH_CHECK);
+        if (r < 0) {
+            return result;
+        }
 
         sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus_message* reply = nullptr;
-        r = sd_bus_call(bus, msg, timeout_ms_to_usec(timeout_ms), &error, &reply);
+        r = sd_bus_call(bus, msg, timeout_ms_to_usec(timeout_ms), &error,
+                        &reply);
         sd_bus_message_unref(msg);
         sd_bus_error_free(&error);
-        if (r < 0) return result;
+        if (r < 0) {
+            return result;
+        }
 
         int healthy_int = 0;
         uint64_t cache_entries = 0, cache_size_bytes = 0;
@@ -263,12 +326,15 @@ public:
         uint64_t crl_requests = 0, crl_hits = 0, crl_errors = 0;
         uint64_t aia_requests = 0, aia_hits = 0, aia_errors = 0;
 
-        r = sd_bus_message_read(reply, "bttttttttttttt", &healthy_int, &cache_entries,
-                                 &cache_size_bytes, &mem_entries, &mem_size_bytes, &ocsp_requests,
-                                 &ocsp_hits, &ocsp_errors, &crl_requests, &crl_hits, &crl_errors,
-                                 &aia_requests, &aia_hits, &aia_errors);
+        r = sd_bus_message_read(
+            reply, "bttttttttttttt", &healthy_int, &cache_entries,
+            &cache_size_bytes, &mem_entries, &mem_size_bytes, &ocsp_requests,
+            &ocsp_hits, &ocsp_errors, &crl_requests, &crl_hits, &crl_errors,
+            &aia_requests, &aia_hits, &aia_errors);
         sd_bus_message_unref(reply);
-        if (r < 0) return result;
+        if (r < 0) {
+            return result;
+        }
 
         result.reachable = true;
         result.health.healthy = healthy_int != 0;
@@ -290,43 +356,56 @@ private:
         // "чистого" сетевого таймаута, который отсчитывает cert-helper
         // внутри себя (http_client.hpp). Без запаса D-Bus мог бы оборвать
         // вызов чуть раньше, чем демон успеет отдать уже готовый ответ.
-        constexpr uint64_t kIpcOverheadUsec = 500'000; // 500ms
-        return static_cast<uint64_t>(timeout_ms) * 1000ull + kIpcOverheadUsec;
+        constexpr uint64_t ipc_overhead_usec = 500'000;  // 500ms
+        return static_cast<uint64_t>(timeout_ms) * 1000ull + ipc_overhead_usec;
     }
 
     void ensure_connected() {
-        if (bus != nullptr) return;
+        if (bus != nullptr) {
+            return;
+        }
         int r;
         if (bus_address.empty()) {
             r = sd_bus_open_system(&bus);
         } else {
             r = sd_bus_new(&bus);
-            if (r >= 0) r = sd_bus_set_address(bus, bus_address.c_str());
-            if (r >= 0) r = sd_bus_set_bus_client(bus, 1);
-            if (r >= 0) r = sd_bus_start(bus);
+            if (r >= 0) {
+                r = sd_bus_set_address(bus, bus_address.c_str());
+            }
+            if (r >= 0) {
+                r = sd_bus_set_bus_client(bus, 1);
+            }
+            if (r >= 0) {
+                r = sd_bus_start(bus);
+            }
         }
         if (r < 0) {
             if (bus != nullptr) {
                 sd_bus_unref(bus);
                 bus = nullptr;
             }
-            throw DbusClientError(std::string("failed to connect to D-Bus: ") + std::strerror(-r));
+            throw DbusClientError(std::string("failed to connect to D-Bus: ") +
+                                  std::strerror(-r));
         }
     }
 
-    proto::FetchResponse call_and_parse_fetch(int build_result, sd_bus_message* msg,
-                                               uint32_t timeout_ms) {
+    proto::FetchResponse call_and_parse_fetch(int build_result,
+                                              sd_bus_message* msg,
+                                              uint32_t timeout_ms) {
         proto::FetchResponse result;
-        result.status = proto::FetchStatus::NetworkError;
+        result.status = proto::FetchStatus::NETWORK_ERROR;
 
         if (build_result < 0) {
-            if (msg != nullptr) sd_bus_message_unref(msg);
+            if (msg != nullptr) {
+                sd_bus_message_unref(msg);
+            }
             return result;
         }
 
         sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus_message* reply = nullptr;
-        int r = sd_bus_call(bus, msg, timeout_ms_to_usec(timeout_ms), &error, &reply);
+        int r = sd_bus_call(bus, msg, timeout_ms_to_usec(timeout_ms), &error,
+                            &reply);
         sd_bus_message_unref(msg);
 
         if (r < 0) {
@@ -335,21 +414,28 @@ private:
             // ошибок, чтобы вызывающий код (client.hpp) мог при желании
             // разделить их, хотя контракт OcspFetcher/CrlFetcher в итоге
             // всё равно сворачивает оба случая в "пустой вектор".
-            result.status = (r == -ETIMEDOUT) ? proto::FetchStatus::Timeout
-                                                : proto::FetchStatus::NetworkError;
+            result.status = (r == -ETIMEDOUT)
+                                ? proto::FetchStatus::TIMEOUT
+                                : proto::FetchStatus::NETWORK_ERROR;
             sd_bus_error_free(&error);
             return result;
         }
         sd_bus_error_free(&error);
 
-        uint8_t status_byte = static_cast<uint8_t>(proto::FetchStatus::InvalidResponse);
-        const void* payload_ptr = nullptr;
+        uint8_t status_byte =
+            static_cast<uint8_t>(proto::FetchStatus::INVALID_RESPONSE);
+        void const* payload_ptr = nullptr;
         size_t payload_len = 0;
         int from_cache_int = 0;
 
         r = sd_bus_message_read(reply, "y", &status_byte);
-        if (r >= 0) r = sd_bus_message_read_array(reply, 'y', &payload_ptr, &payload_len);
-        if (r >= 0) r = sd_bus_message_read(reply, "b", &from_cache_int);
+        if (r >= 0) {
+            r = sd_bus_message_read_array(reply, 'y', &payload_ptr,
+                                          &payload_len);
+        }
+        if (r >= 0) {
+            r = sd_bus_message_read(reply, "b", &from_cache_int);
+        }
 
         // ВАЖНО: payload_ptr указывает внутрь буфера самого sd_bus_message
         // (sd_bus_message_read_array не копирует данные — только отдаёт
@@ -364,15 +450,17 @@ private:
         // молчаливую порчу данных (не падение, не ошибку — просто другие
         // байты), что гораздо опаснее падения.
         if (r >= 0 && payload_len > 0) {
-            result.payload_der.assign(static_cast<const uint8_t*>(payload_ptr),
-                                       static_cast<const uint8_t*>(payload_ptr) + payload_len);
+            result.payload_der.assign(
+                static_cast<uint8_t const*>(payload_ptr),
+                static_cast<uint8_t const*>(payload_ptr) + payload_len);
         }
 
         sd_bus_message_unref(reply);
 
         if (r < 0) {
-            result.status = proto::FetchStatus::InvalidResponse;
-            result.payload_der.clear(); // не отдавать частично скопированный или неполный payload
+            result.status = proto::FetchStatus::INVALID_RESPONSE;
+            result.payload_der.clear();  // не отдавать частично скопированный
+                                         // или неполный payload
             return result;
         }
 
@@ -385,4 +473,4 @@ private:
     sd_bus* bus = nullptr;
 };
 
-} // namespace cert_helper::client_impl
+}  // namespace cert_helper::client_impl

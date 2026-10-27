@@ -26,8 +26,10 @@
 //                 cache_hit       — ответ из кэша, сеть не трогали
 //                 network_fetch   — запрос ушёл во внешнюю сеть
 //                 shared_inflight — точно такой же запрос уже выполнялся в
-//                                   этот момент (singleflight), взят его результат
-//                 blocked         — демон САМ отказался выполнять запрос, см. reason
+//                                   этот момент (singleflight), взят его
+//                                   результат
+//                 blocked         — демон САМ отказался выполнять запрос, см.
+//                 reason
 //   result      ok | timeout | network_error | invalid_response
 //   reason      только при blocked: invalid_url | https_disabled |
 //               https_unavailable | port_denied | address_denied |
@@ -72,6 +74,10 @@
 
 #pragma once
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -82,72 +88,92 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include "../include/cert_helper/protocol.hpp"
 #include "logging.hpp"
 
 namespace cert_helper::audit {
 
-enum class RequestType : uint8_t { Ocsp, Crl, Aia };
-enum class Decision : uint8_t { CacheHit, NetworkFetch, SharedInflight, Blocked };
+enum class RequestType : uint8_t { OCSP, CRL, AIA };
+enum class Decision : uint8_t {
+    CACHE_HIT,
+    NETWORK_FETCH,
+    SHARED_INFLIGHT,
+    BLOCKED
+};
 
-inline const char* request_type_name(RequestType t) {
+inline char const* request_type_name(RequestType t) {
     switch (t) {
-        case RequestType::Ocsp: return "ocsp";
-        case RequestType::Crl: return "crl";
-        case RequestType::Aia: return "aia";
+        case RequestType::OCSP:
+            return "ocsp";
+        case RequestType::CRL:
+            return "crl";
+        case RequestType::AIA:
+            return "aia";
     }
     return "";
 }
 
-inline const char* decision_name(Decision d) {
+inline char const* decision_name(Decision d) {
     switch (d) {
-        case Decision::CacheHit: return "cache_hit";
-        case Decision::NetworkFetch: return "network_fetch";
-        case Decision::SharedInflight: return "shared_inflight";
-        case Decision::Blocked: return "blocked";
+        case Decision::CACHE_HIT:
+            return "cache_hit";
+        case Decision::NETWORK_FETCH:
+            return "network_fetch";
+        case Decision::SHARED_INFLIGHT:
+            return "shared_inflight";
+        case Decision::BLOCKED:
+            return "blocked";
     }
     return "";
 }
 
-inline const char* status_name(protocol::FetchStatus s) {
+inline char const* status_name(protocol::FetchStatus s) {
     switch (s) {
-        case protocol::FetchStatus::Ok: return "ok";
-        case protocol::FetchStatus::Timeout: return "timeout";
-        case protocol::FetchStatus::NetworkError: return "network_error";
-        case protocol::FetchStatus::InvalidResponse: return "invalid_response";
+        case protocol::FetchStatus::OK:
+            return "ok";
+        case protocol::FetchStatus::TIMEOUT:
+            return "timeout";
+        case protocol::FetchStatus::NETWORK_ERROR:
+            return "network_error";
+        case protocol::FetchStatus::INVALID_RESPONSE:
+            return "invalid_response";
     }
     return "network_error";
 }
 
 struct FetchEvent {
-    RequestType type = RequestType::Ocsp;
+    RequestType type = RequestType::OCSP;
     std::string url;
-    Decision decision = Decision::NetworkFetch;
+    Decision decision = Decision::NETWORK_FETCH;
     std::string result;
-    std::string reason;       // только для Blocked
-    std::string serial;       // только для ocsp
+    std::string reason;  // только для Blocked
+    std::string serial;  // только для ocsp
     uint64_t bytes = 0;
     uint64_t duration_ms = 0;
-    int http_status = 0;      // 0 — не было HTTP-ответа / неприменимо
+    int http_status = 0;  // 0 — не было HTTP-ответа / неприменимо
     uint32_t batch_size = 0;  // > 1 — часть объединённого OCSP-запроса
 };
 
-inline std::vector<log::Field> to_fields(const FetchEvent& e) {
+inline std::vector<log::Field> to_fields(FetchEvent const& e) {
     std::vector<log::Field> f;
     f.push_back(log::field("type", request_type_name(e.type)));
     f.push_back(log::field("url", e.url));
-    if (!e.serial.empty()) f.push_back(log::field("serial", e.serial));
+    if (!e.serial.empty()) {
+        f.push_back(log::field("serial", e.serial));
+    }
     f.push_back(log::field("decision", decision_name(e.decision)));
     f.push_back(log::field("result", e.result));
-    if (!e.reason.empty()) f.push_back(log::field("reason", e.reason));
+    if (!e.reason.empty()) {
+        f.push_back(log::field("reason", e.reason));
+    }
     f.push_back(log::field("bytes", e.bytes));
     f.push_back(log::field("duration_ms", e.duration_ms));
-    if (e.http_status > 0) f.push_back(log::field("http_status", e.http_status));
-    if (e.batch_size > 1) f.push_back(log::field("batch_size", e.batch_size));
+    if (e.http_status > 0) {
+        f.push_back(log::field("http_status", e.http_status));
+    }
+    if (e.batch_size > 1) {
+        f.push_back(log::field("batch_size", e.batch_size));
+    }
     return f;
 }
 
@@ -157,30 +183,34 @@ inline std::vector<log::Field> to_fields(const FetchEvent& e) {
 class IAuditSink {
 public:
     virtual ~IAuditSink() = default;
-    virtual void record(std::string_view event, const std::vector<log::Field>& fields) = 0;
+    virtual void record(std::string_view event,
+                        std::vector<log::Field> const& fields) = 0;
 };
 
 // Одна строка журнала без завершающего '\n'. Чистая функция — тестируется
 // отдельно от файлового ввода-вывода. Ключи полей ts/seq/event зарезервированы:
 // совпавший ключ получает суффикс '_', чтобы не подменить служебное поле.
-inline std::string format_audit_line(int64_t unix_ms, uint64_t seq, std::string_view event,
-                                     const std::vector<log::Field>& fields) {
+inline std::string format_audit_line(int64_t unix_ms, uint64_t seq,
+                                     std::string_view event,
+                                     std::vector<log::Field> const& fields) {
     std::string out = "{\"ts\":";
     log::detail::append_json_escaped(out, log::format_timestamp(unix_ms));
     out += ",\"seq\":";
     out += std::to_string(seq);
     out += ",\"event\":";
     log::detail::append_json_escaped(out, event);
-    for (const auto& f : fields) {
+    for (auto const& f : fields) {
         std::string key = f.key;
-        if (key == "ts" || key == "seq" || key == "event") key.push_back('_');
+        if (key == "ts" || key == "seq" || key == "event") {
+            key.push_back('_');
+        }
         out.push_back(',');
         log::detail::append_json_escaped(out, key);
         out.push_back(':');
-        if (f.kind == log::Field::Kind::String) {
+        if (f.kind == log::Field::Kind::STRING) {
             log::detail::append_json_escaped(out, f.value);
         } else {
-            out += f.value; // Number/Bool — уже валидный JSON-литерал
+            out += f.value;  // Number/Bool — уже валидный JSON-литерал
         }
     }
     out.push_back('}');
@@ -194,102 +224,120 @@ public:
         bool fsync_each_event = false;
     };
 
-    explicit FileAuditLog(Options options) : options_(std::move(options)) {}
+    explicit FileAuditLog(Options options) : options(std::move(options)) {}
     ~FileAuditLog() override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex);
         close_locked();
     }
-    FileAuditLog(const FileAuditLog&) = delete;
-    FileAuditLog& operator=(const FileAuditLog&) = delete;
+    FileAuditLog(FileAuditLog const&) = delete;
+    FileAuditLog& operator=(FileAuditLog const&) = delete;
 
     // Открывает (при необходимости создаёт) файл. Вызывается при старте
     // демона: если не получилось — демон не должен стартовать молча без
     // аудита, который оператор явно потребовал.
     bool open(std::string* error = nullptr) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (open_locked()) return true;
-        if (error != nullptr) *error = last_error_;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (open_locked()) {
+            return true;
+        }
+        if (error != nullptr) {
+            *error = last_error;
+        }
         return false;
     }
 
-    void record(std::string_view event, const std::vector<log::Field>& fields) override {
+    void record(std::string_view event,
+                std::vector<log::Field> const& fields) override {
         try {
-            std::lock_guard<std::mutex> lock(mutex_);
-            const uint64_t seq = ++seq_; // до записи — см. "ГАРАНТИИ" в шапке файла
-            std::string line = format_audit_line(log::now_unix_ms(), seq, event, fields);
+            std::lock_guard<std::mutex> lock(mutex);
+            uint64_t const seq =
+                ++sequence;  // до записи — см. "ГАРАНТИИ" в шапке файла
+            std::string line =
+                format_audit_line(log::now_unix_ms(), seq, event, fields);
             line.push_back('\n');
             // Прошлая запись оборвалась посреди строки и закрыть её не
             // удалось — начинаем с перевода строки, иначе эта (хорошая)
             // запись слиплась бы с огрызком в одну нечитаемую строку.
-            if (dirty_tail_) line.insert(line.begin(), '\n');
+            if (dirty_tail) {
+                line.insert(line.begin(), '\n');
+            }
 
             bool ok = ensure_current_locked() && write_all_locked(line);
-            if (ok && options_.fsync_each_event && ::fsync(fd_) != 0) {
-                last_error_ = std::strerror(errno);
+            if (ok && options.fsync_each_event &&
+                ::fsync(file_descriptor) != 0) {
+                last_error = std::strerror(errno);
                 ok = false;
             }
 
             if (ok) {
-                dirty_tail_ = false;
-                if (failing_) {
-                    failing_ = false;
-                    log::info("audit", "audit log writes recovered", {log::field("path", options_.path)});
+                dirty_tail = false;
+                if (failing) {
+                    failing = false;
+                    log::info("audit", "audit log writes recovered",
+                              {log::field("path", options.path)});
                 }
             } else {
-                failures_.fetch_add(1, std::memory_order_relaxed);
-                if (!failing_) {
-                    failing_ = true;
+                failures.fetch_add(1, std::memory_order_relaxed);
+                if (!failing) {
+                    failing = true;
                     log::error("audit",
-                               "audit log write failed — events are lost until it recovers "
+                               "audit log write failed — events are lost until "
+                               "it recovers "
                                "(gap in seq will show how many)",
-                               {log::field("path", options_.path), log::field("error", last_error_)});
+                               {log::field("path", options.path),
+                                log::field("error", last_error)});
                 }
             }
         } catch (...) {
-            failures_.fetch_add(1, std::memory_order_relaxed);
+            failures.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
     // Сколько событий не удалось записать с момента старта.
-    uint64_t write_failures() const { return failures_.load(std::memory_order_relaxed); }
+    uint64_t write_failures() const {
+        return failures.load(std::memory_order_relaxed);
+    }
 
 private:
     bool open_locked() {
-        int fd = ::open(options_.path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0640);
+        int fd = ::open(options.path.c_str(),
+                        O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+                        0640);
         if (fd < 0) {
-            last_error_ = std::strerror(errno);
+            last_error = std::strerror(errno);
             return false;
         }
-        struct stat st{};
+        struct stat st {};
         if (::fstat(fd, &st) != 0) {
-            last_error_ = std::strerror(errno);
+            last_error = std::strerror(errno);
             ::close(fd);
             return false;
         }
         if (!S_ISREG(st.st_mode)) {
-            last_error_ = "not a regular file";
+            last_error = "not a regular file";
             ::close(fd);
             return false;
         }
-        fd_ = fd;
-        dev_ = st.st_dev;
-        ino_ = st.st_ino;
+        file_descriptor = fd;
+        dev = st.st_dev;
+        ino = st.st_ino;
         return true;
     }
 
     void close_locked() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
+        if (file_descriptor >= 0) {
+            ::close(file_descriptor);
+            file_descriptor = -1;
         }
     }
 
     // Если файл по пути уже не тот (переименован/удалён/заменён ротацией) —
     // переоткрываем; иначе продолжали бы писать в ротированный файл.
     bool ensure_current_locked() {
-        if (fd_ >= 0) {
-            struct stat st{};
-            if (::stat(options_.path.c_str(), &st) == 0 && st.st_dev == dev_ && st.st_ino == ino_) {
+        if (file_descriptor >= 0) {
+            struct stat st {};
+            if (::stat(options.path.c_str(), &st) == 0 && st.st_dev == dev &&
+                st.st_ino == ino) {
                 return true;
             }
             close_locked();
@@ -297,19 +345,22 @@ private:
         return open_locked();
     }
 
-    bool write_all_locked(const std::string& data) {
+    bool write_all_locked(std::string const& data) {
         size_t written = 0;
         while (written < data.size()) {
-            ssize_t n = ::write(fd_, data.data() + written, data.size() - written);
+            ssize_t n = ::write(file_descriptor, data.data() + written,
+                                data.size() - written);
             if (n < 0) {
-                if (errno == EINTR) continue;
-                last_error_ = std::strerror(errno);
+                if (errno == EINTR) {
+                    continue;
+                }
+                last_error = std::strerror(errno);
                 if (written > 0) {
                     // Оборванная посреди строки запись: пытаемся закрыть
                     // огрызок переводом строки. Не вышло (типично: то же
                     // самое "диск полон") — помним об этом (dirty_tail_),
                     // и СЛЕДУЮЩАЯ успешная запись начнёт с '\n'.
-                    dirty_tail_ = (::write(fd_, "\n", 1) != 1);
+                    dirty_tail = (::write(file_descriptor, "\n", 1) != 1);
                 }
                 return false;
             }
@@ -318,16 +369,16 @@ private:
         return true;
     }
 
-    const Options options_;
-    std::mutex mutex_;
-    int fd_ = -1;
-    dev_t dev_ = 0;
-    ino_t ino_ = 0;
-    uint64_t seq_ = 0;
-    bool failing_ = false;
-    bool dirty_tail_ = false; // в конце файла остался незакрытый обрывок строки
-    std::string last_error_;
-    std::atomic<uint64_t> failures_{0};
+    Options const options;
+    std::mutex mutex;
+    int file_descriptor = -1;
+    dev_t dev = 0;
+    ino_t ino = 0;
+    uint64_t sequence = 0;
+    bool failing = false;
+    bool dirty_tail = false;  // в конце файла остался незакрытый обрывок строки
+    std::string last_error;
+    std::atomic<uint64_t> failures{0};
 };
 
-} // namespace cert_helper::audit
+}  // namespace cert_helper::audit

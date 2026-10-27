@@ -7,16 +7,16 @@
 
 #pragma once
 
+#include <openssl/ocsp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
-
-#include <openssl/ocsp.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
 
 namespace test_util {
 
@@ -25,12 +25,13 @@ inline int& failure_count() {
     return count;
 }
 
-inline void report_failure(const std::string& expr, const char* file, int line) {
+inline void report_failure(std::string const& expr, char const* file,
+                           int line) {
     std::fprintf(stderr, "FAIL: %s (%s:%d)\n", expr.c_str(), file, line);
     ++failure_count();
 }
 
-inline void report_pass(const std::string& name) {
+inline void report_pass(std::string const& name) {
     std::fprintf(stdout, "PASS: %s\n", name.c_str());
 }
 
@@ -53,22 +54,26 @@ inline void report_pass(const std::string& name) {
 // через OpenSSL C API напрямую (без внешних зависимостей вроде Python),
 // а не полагаться на статический файл с датами, вычисленными когда-то в
 // прошлом.
-inline std::vector<uint8_t> generate_self_signed_cert_der(const std::string& common_name,
-                                                            int not_before_days_offset,
-                                                            int not_after_days_offset) {
-    EVP_PKEY* pkey = EVP_RSA_gen(2048); // OpenSSL 3.0+ non-deprecated one-shot keygen
+inline std::vector<uint8_t> generate_self_signed_cert_der(
+    std::string const& common_name, int not_before_days_offset,
+    int not_after_days_offset) {
+    EVP_PKEY* pkey =
+        EVP_RSA_gen(2048);  // OpenSSL 3.0+ non-deprecated one-shot keygen
 
     X509* cert = X509_new();
-    X509_set_version(cert, 2); // X.509v3
+    X509_set_version(cert, 2);  // X.509v3
     ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
-    X509_gmtime_adj(X509_getm_notBefore(cert), 60L * 60 * 24 * not_before_days_offset);
-    X509_gmtime_adj(X509_getm_notAfter(cert), 60L * 60 * 24 * not_after_days_offset);
+    X509_gmtime_adj(X509_getm_notBefore(cert),
+                    60L * 60 * 24 * not_before_days_offset);
+    X509_gmtime_adj(X509_getm_notAfter(cert),
+                    60L * 60 * 24 * not_after_days_offset);
     X509_set_pubkey(cert, pkey);
 
     X509_NAME* name = X509_get_subject_name(cert);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                                reinterpret_cast<const unsigned char*>(common_name.c_str()), -1, -1, 0);
-    X509_set_issuer_name(cert, name); // самоподписанный — issuer == subject
+    X509_NAME_add_entry_by_txt(
+        name, "CN", MBSTRING_ASC,
+        reinterpret_cast<unsigned char const*>(common_name.c_str()), -1, -1, 0);
+    X509_set_issuer_name(cert, name);  // самоподписанный — issuer == subject
 
     X509_sign(cert, pkey, EVP_sha256());
 
@@ -115,23 +120,28 @@ struct OcspBatchFixtures {
     std::vector<uint8_t> combined_response;
 };
 
-inline OcspBatchFixtures generate_ocsp_batch_fixtures(int next_update_a_hours_offset,
-                                                       int next_update_b_hours_offset) {
+inline OcspBatchFixtures generate_ocsp_batch_fixtures(
+    int next_update_a_hours_offset, int next_update_b_hours_offset) {
     auto gen_key = [] { return EVP_RSA_gen(2048); };
-    auto make_cert = [](const char* cn, X509* issuer_cert, EVP_PKEY* issuer_key, EVP_PKEY* subject_key,
-                        long serial, int not_before_days, int not_after_days, bool is_ca) {
+    auto make_cert = [](char const* cn, X509* issuer_cert, EVP_PKEY* issuer_key,
+                        EVP_PKEY* subject_key, long serial, int not_before_days,
+                        int not_after_days, bool is_ca) {
         X509* cert = X509_new();
         X509_set_version(cert, 2);
         ASN1_INTEGER_set(X509_get_serialNumber(cert), serial);
-        X509_gmtime_adj(X509_getm_notBefore(cert), 60L * 60 * 24 * not_before_days);
-        X509_gmtime_adj(X509_getm_notAfter(cert), 60L * 60 * 24 * not_after_days);
+        X509_gmtime_adj(X509_getm_notBefore(cert),
+                        60L * 60 * 24 * not_before_days);
+        X509_gmtime_adj(X509_getm_notAfter(cert),
+                        60L * 60 * 24 * not_after_days);
         X509_set_pubkey(cert, subject_key);
         X509_NAME* name = X509_get_subject_name(cert);
-        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char*)cn, -1, -1, 0);
-        X509_set_issuer_name(cert, issuer_cert ? X509_get_subject_name(issuer_cert) : name);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   (unsigned char const*)cn, -1, -1, 0);
+        X509_set_issuer_name(
+            cert, issuer_cert ? X509_get_subject_name(issuer_cert) : name);
         if (is_ca) {
-            X509_EXTENSION* ext =
-                X509V3_EXT_conf_nid(nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE");
+            X509_EXTENSION* ext = X509V3_EXT_conf_nid(
+                nullptr, nullptr, NID_basic_constraints, "critical,CA:TRUE");
             X509_add_ext(cert, ext, -1);
             X509_EXTENSION_free(ext);
         }
@@ -140,11 +150,14 @@ inline OcspBatchFixtures generate_ocsp_batch_fixtures(int next_update_a_hours_of
     };
 
     EVP_PKEY* ca_key = gen_key();
-    X509* ca_cert = make_cert("test-issuer-ocsp-batch.example.test", nullptr, ca_key, ca_key, 1, -1, 3650, true);
+    X509* ca_cert = make_cert("test-issuer-ocsp-batch.example.test", nullptr,
+                              ca_key, ca_key, 1, -1, 3650, true);
     EVP_PKEY* leaf_a_key = gen_key();
-    X509* leaf_a = make_cert("leaf-ocsp-batch-a.example.test", ca_cert, ca_key, leaf_a_key, 100, -1, 365, false);
+    X509* leaf_a = make_cert("leaf-ocsp-batch-a.example.test", ca_cert, ca_key,
+                             leaf_a_key, 100, -1, 365, false);
     EVP_PKEY* leaf_b_key = gen_key();
-    X509* leaf_b = make_cert("leaf-ocsp-batch-b.example.test", ca_cert, ca_key, leaf_b_key, 101, -1, 365, false);
+    X509* leaf_b = make_cert("leaf-ocsp-batch-b.example.test", ca_cert, ca_key,
+                             leaf_b_key, 101, -1, 365, false);
 
     OCSP_CERTID* certid_a = OCSP_cert_to_id(EVP_sha1(), leaf_a, ca_cert);
     OCSP_CERTID* certid_b = OCSP_cert_to_id(EVP_sha1(), leaf_b, ca_cert);
@@ -173,12 +186,17 @@ inline OcspBatchFixtures generate_ocsp_batch_fixtures(int next_update_a_hours_of
 
     OCSP_BASICRESP* basic = OCSP_BASICRESP_new();
     ASN1_TIME* this_update = ASN1_TIME_adj(nullptr, time(nullptr), 0, 0);
-    ASN1_TIME* next_update_a = ASN1_TIME_adj(nullptr, time(nullptr), 0, 60 * 60 * next_update_a_hours_offset);
-    ASN1_TIME* next_update_b = ASN1_TIME_adj(nullptr, time(nullptr), 0, 60 * 60 * next_update_b_hours_offset);
-    OCSP_basic_add1_status(basic, certid_a, V_OCSP_CERTSTATUS_GOOD, 0, nullptr, this_update, next_update_a);
-    OCSP_basic_add1_status(basic, certid_b, V_OCSP_CERTSTATUS_GOOD, 0, nullptr, this_update, next_update_b);
+    ASN1_TIME* next_update_a = ASN1_TIME_adj(
+        nullptr, time(nullptr), 0, 60 * 60 * next_update_a_hours_offset);
+    ASN1_TIME* next_update_b = ASN1_TIME_adj(
+        nullptr, time(nullptr), 0, 60 * 60 * next_update_b_hours_offset);
+    OCSP_basic_add1_status(basic, certid_a, V_OCSP_CERTSTATUS_GOOD, 0, nullptr,
+                           this_update, next_update_a);
+    OCSP_basic_add1_status(basic, certid_b, V_OCSP_CERTSTATUS_GOOD, 0, nullptr,
+                           this_update, next_update_b);
     OCSP_basic_sign(basic, ca_cert, ca_key, EVP_sha256(), nullptr, 0);
-    OCSP_RESPONSE* ocsp_resp = OCSP_response_create(OCSP_RESPONSE_STATUS_SUCCESSFUL, basic);
+    OCSP_RESPONSE* ocsp_resp =
+        OCSP_response_create(OCSP_RESPONSE_STATUS_SUCCESSFUL, basic);
     {
         unsigned char* der = nullptr;
         int len = i2d_OCSP_RESPONSE(ocsp_resp, &der);
@@ -203,31 +221,30 @@ inline OcspBatchFixtures generate_ocsp_batch_fixtures(int next_update_a_hours_of
     return out;
 }
 
-} // namespace test_util
+}  // namespace test_util
 
-#define TEST_CHECK(cond)                                                        \
-    do {                                                                        \
-        if (!(cond)) {                                                          \
-            test_util::report_failure(#cond, __FILE__, __LINE__);               \
-        }                                                                       \
+#define TEST_CHECK(cond)                                          \
+    do {                                                          \
+        if (!(cond)) {                                            \
+            test_util::report_failure(#cond, __FILE__, __LINE__); \
+        }                                                         \
     } while (0)
 
-#define TEST_CHECK_EQ(a, b)                                                     \
-    do {                                                                        \
-        auto va = (a);                                                         \
-        auto vb = (b);                                                         \
-        if (!(va == vb)) {                                                      \
-            std::ostringstream oss;                                             \
-            oss << #a " == " #b " (got " << va << " vs " << vb << ")";          \
-            test_util::report_failure(oss.str(), __FILE__, __LINE__);           \
-        }                                                                       \
+#define TEST_CHECK_EQ(a, b)                                            \
+    do {                                                               \
+        auto va = (a);                                                 \
+        auto vb = (b);                                                 \
+        if (!(va == vb)) {                                             \
+            std::ostringstream oss;                                    \
+            oss << #a " == " #b " (got " << va << " vs " << vb << ")"; \
+            test_util::report_failure(oss.str(), __FILE__, __LINE__);  \
+        }                                                              \
     } while (0)
 
-#define RUN_TEST(fn)                                                            \
-    do {                                                                        \
-        fn();                                                                   \
-        test_util::report_pass(#fn);                                            \
+#define RUN_TEST(fn)                 \
+    do {                             \
+        fn();                        \
+        test_util::report_pass(#fn); \
     } while (0)
 
-#define TEST_MAIN_EXIT()                                                        \
-    return test_util::failure_count() == 0 ? 0 : 1
+#define TEST_MAIN_EXIT() return test_util::failure_count() == 0 ? 0 : 1

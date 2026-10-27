@@ -25,10 +25,11 @@
 namespace cert_helper::protocol {
 
 enum class FetchStatus : uint8_t {
-    Ok = 0,
-    Timeout = 1,
-    NetworkError = 2,
-    InvalidResponse = 3, // сервер ответил, но данные не разобрать / не прошли проверку
+    OK = 0,
+    TIMEOUT = 1,
+    NETWORK_ERROR = 2,
+    INVALID_RESPONSE =
+        3,  // сервер ответил, но данные не разобрать / не прошли проверку
 };
 
 struct FetchOcspRequest {
@@ -48,7 +49,7 @@ struct FetchIntermediateCertRequest {
 };
 
 struct FetchResponse {
-    FetchStatus status = FetchStatus::NetworkError;
+    FetchStatus status = FetchStatus::NETWORK_ERROR;
     std::vector<uint8_t> payload_der;
     bool from_cache = false;
 };
@@ -86,7 +87,8 @@ struct FetchOcspBatchRequest {
 };
 
 struct FetchOcspBatchResponse {
-    std::vector<FetchResponse> responses; // тот же размер/порядок, что и requests
+    std::vector<FetchResponse>
+        responses;  // тот же размер/порядок, что и requests
 };
 
 // Разбивка наблюдаемости по типу запроса (пункт 5: "раздельная
@@ -117,4 +119,4 @@ struct HealthCheckResponse {
     RequestTypeStats intermediate_cert;
 };
 
-} // namespace cert_helper::protocol
+}  // namespace cert_helper::protocol

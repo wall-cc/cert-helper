@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <openssl/sha.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -41,16 +43,14 @@
 #include <unordered_map>
 #include <vector>
 
-#include <openssl/sha.h>
-
 namespace cert_helper::cache {
 
 namespace fs = std::filesystem;
 
 enum class EntryKind : uint8_t {
-    Ocsp = 0,
-    Crl = 1,
-    IntermediateCert = 2,
+    OCSP = 0,
+    CRL = 1,
+    INTERMEDIATE_CERT = 2,
 };
 
 struct CacheEntry {
@@ -78,8 +78,10 @@ struct CacheStats {
 class ICacheStore {
 public:
     virtual ~ICacheStore() = default;
-    virtual std::optional<CacheEntry> get(EntryKind kind, const std::string& key) = 0;
-    virtual void put(EntryKind kind, const std::string& key, const CacheEntry& entry) = 0;
+    virtual std::optional<CacheEntry> get(EntryKind kind,
+                                          std::string const& key) = 0;
+    virtual void put(EntryKind kind, std::string const& key,
+                     CacheEntry const& entry) = 0;
     virtual CacheStats stats() = 0;
 };
 
@@ -90,7 +92,7 @@ class FileCacheStore : public ICacheStore {
 public:
     struct Limits {
         uint64_t max_entries = 100000;
-        uint64_t max_size_bytes = 512ull * 1024 * 1024; // 512 МиБ по умолчанию
+        uint64_t max_size_bytes = 512ull * 1024 * 1024;  // 512 МиБ по умолчанию
     };
 
     FileCacheStore(fs::path root_dir, Limits limits)
@@ -99,11 +101,14 @@ public:
         load_index();
     }
 
-    std::optional<CacheEntry> get(EntryKind kind, const std::string& key) override {
+    std::optional<CacheEntry> get(EntryKind kind,
+                                  std::string const& key) override {
         std::lock_guard<std::mutex> lock(mutex);
         std::string filename = make_filename(kind, key);
         auto it = index.find(filename);
-        if (it == index.end()) return std::nullopt;
+        if (it == index.end()) {
+            return std::nullopt;
+        }
 
         int64_t now = now_seconds();
         if (it->second.valid_until != 0 && now >= it->second.valid_until) {
@@ -125,7 +130,8 @@ public:
         return entry;
     }
 
-    void put(EntryKind kind, const std::string& key, const CacheEntry& entry) override {
+    void put(EntryKind kind, std::string const& key,
+             CacheEntry const& entry) override {
         std::lock_guard<std::mutex> lock(mutex);
         std::string filename = make_filename(kind, key);
         write_entry_file(filename, entry);
@@ -143,7 +149,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         CacheStats s;
         s.entries = index.size();
-        for (const auto& [name, rec] : index) {
+        for (auto const& [name, rec] : index) {
             s.size_bytes += rec.size_bytes;
         }
         return s;
@@ -153,7 +159,7 @@ private:
     struct IndexRecord {
         uint64_t size_bytes = 0;
         int64_t valid_until = 0;
-        uint64_t lru_seq = 0; // больше = использовано позже
+        uint64_t lru_seq = 0;  // больше = использовано позже
     };
 
     static int64_t now_seconds() {
@@ -162,10 +168,11 @@ private:
             .count();
     }
 
-    static std::string sha256_hex(const std::string& s) {
+    static std::string sha256_hex(std::string const& s) {
         unsigned char digest[SHA256_DIGEST_LENGTH];
-        SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), digest);
-        static const char* hex = "0123456789abcdef";
+        SHA256(reinterpret_cast<unsigned char const*>(s.data()), s.size(),
+               digest);
+        static char const* hex = "0123456789abcdef";
         std::string out;
         out.reserve(SHA256_DIGEST_LENGTH * 2);
         for (unsigned char b : digest) {
@@ -175,25 +182,32 @@ private:
         return out;
     }
 
-    std::string make_filename(EntryKind kind, const std::string& key) {
-        std::string composite = std::to_string(static_cast<int>(kind)) + "|" + key;
+    std::string make_filename(EntryKind kind, std::string const& key) {
+        std::string composite =
+            std::to_string(static_cast<int>(kind)) + "|" + key;
         return sha256_hex(composite) + ".bin";
     }
 
-    fs::path path_for(const std::string& filename) const { return root / filename; }
+    fs::path path_for(std::string const& filename) const {
+        return root / filename;
+    }
 
-    void write_entry_file(const std::string& filename, const CacheEntry& entry) {
+    void write_entry_file(std::string const& filename,
+                          CacheEntry const& entry) {
         fs::path final_path = path_for(filename);
         fs::path tmp_path = root / (filename + ".tmp");
 
         {
             std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
-            if (!out) return; // директория недоступна для записи — молча деградируем до "без кэша"
+            if (!out) {
+                return;  // директория недоступна для записи — молча деградируем
+                         // до "без кэша"
+            }
             write_le64(out, static_cast<uint64_t>(entry.fetched_at));
             write_le64(out, static_cast<uint64_t>(entry.valid_until));
             if (!entry.payload.empty()) {
-                out.write(reinterpret_cast<const char*>(entry.payload.data()),
-                           static_cast<std::streamsize>(entry.payload.size()));
+                out.write(reinterpret_cast<char const*>(entry.payload.data()),
+                          static_cast<std::streamsize>(entry.payload.size()));
             }
         }
         // rename() атомарен на одной файловой системе — так мы никогда не
@@ -203,42 +217,58 @@ private:
         fs::rename(tmp_path, final_path, ec);
     }
 
-    std::optional<CacheEntry> read_entry_file(const std::string& filename) {
+    std::optional<CacheEntry> read_entry_file(std::string const& filename) {
         std::ifstream in(path_for(filename), std::ios::binary);
-        if (!in) return std::nullopt;
+        if (!in) {
+            return std::nullopt;
+        }
         CacheEntry entry;
         uint64_t fetched_at = 0, valid_until = 0;
-        if (!read_le64(in, fetched_at)) return std::nullopt;
-        if (!read_le64(in, valid_until)) return std::nullopt;
+        if (!read_le64(in, fetched_at)) {
+            return std::nullopt;
+        }
+        if (!read_le64(in, valid_until)) {
+            return std::nullopt;
+        }
         entry.fetched_at = static_cast<int64_t>(fetched_at);
         entry.valid_until = static_cast<int64_t>(valid_until);
-        entry.payload.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        entry.payload.assign(std::istreambuf_iterator<char>(in),
+                             std::istreambuf_iterator<char>());
         return entry;
     }
 
     static void write_le64(std::ofstream& out, uint64_t v) {
         char buf[8];
-        for (int i = 0; i < 8; ++i) buf[i] = static_cast<char>((v >> (8 * i)) & 0xFF);
+        for (int i = 0; i < 8; ++i) {
+            buf[i] = static_cast<char>((v >> (8 * i)) & 0xFF);
+        }
         out.write(buf, 8);
     }
 
     static bool read_le64(std::ifstream& in, uint64_t& v) {
         char buf[8];
         in.read(buf, 8);
-        if (in.gcount() != 8) return false;
+        if (in.gcount() != 8) {
+            return false;
+        }
         v = 0;
-        for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(static_cast<unsigned char>(buf[i])) << (8 * i);
+        for (int i = 0; i < 8; ++i) {
+            v |= static_cast<uint64_t>(static_cast<unsigned char>(buf[i]))
+                 << (8 * i);
+        }
         return true;
     }
 
-    void remove_file(const std::string& filename) {
+    void remove_file(std::string const& filename) {
         std::error_code ec;
         fs::remove(path_for(filename), ec);
     }
 
-    void touch_lru(const std::string& filename) {
+    void touch_lru(std::string const& filename) {
         auto it = index.find(filename);
-        if (it != index.end()) it->second.lru_seq = next_lru_seq++;
+        if (it != index.end()) {
+            it->second.lru_seq = next_lru_seq++;
+        }
     }
 
     // Восстанавливает индекс по содержимому директории при старте демона —
@@ -248,12 +278,18 @@ private:
     // выстроится заново по фактическому использованию).
     void load_index() {
         std::error_code ec;
-        for (const auto& de : fs::directory_iterator(root, ec)) {
-            if (!de.is_regular_file()) continue;
+        for (auto const& de : fs::directory_iterator(root, ec)) {
+            if (!de.is_regular_file()) {
+                continue;
+            }
             std::string name = de.path().filename().string();
-            if (name.size() < 5 || name.substr(name.size() - 4) != ".bin") continue;
+            if (name.size() < 5 || name.substr(name.size() - 4) != ".bin") {
+                continue;
+            }
             auto entry = read_entry_file(name);
-            if (!entry) continue;
+            if (!entry) {
+                continue;
+            }
             IndexRecord rec;
             rec.size_bytes = entry->payload.size();
             rec.valid_until = entry->valid_until;
@@ -265,7 +301,9 @@ private:
     void evict_if_needed() {
         auto total_size = [this] {
             uint64_t sum = 0;
-            for (auto& [name, rec] : index) sum += rec.size_bytes;
+            for (auto& [name, rec] : index) {
+                sum += rec.size_bytes;
+            }
             return sum;
         };
 
@@ -281,7 +319,8 @@ private:
             }
         }
 
-        if (index.size() <= limits.max_entries && total_size() <= limits.max_size_bytes) {
+        if (index.size() <= limits.max_entries &&
+            total_size() <= limits.max_size_bytes) {
             return;
         }
 
@@ -289,16 +328,19 @@ private:
         // старое использование — первое) и выкидываем, пока не впишемся
         // в лимиты. CRL могут быть тяжёлыми (до нескольких МБ) — поэтому
         // ограничение и по числу записей, и по суммарному размеру.
-        std::vector<std::pair<std::string, IndexRecord>> entries(index.begin(), index.end());
-        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
-            return a.second.lru_seq < b.second.lru_seq;
-        });
+        std::vector<std::pair<std::string, IndexRecord>> entries(index.begin(),
+                                                                 index.end());
+        std::sort(entries.begin(), entries.end(),
+                  [](auto const& a, auto const& b) {
+                      return a.second.lru_seq < b.second.lru_seq;
+                  });
 
         uint64_t size = total_size();
         size_t i = 0;
-        while ((index.size() > limits.max_entries || size > limits.max_size_bytes) &&
+        while ((index.size() > limits.max_entries ||
+                size > limits.max_size_bytes) &&
                i < entries.size()) {
-            const auto& [name, rec] = entries[i++];
+            auto const& [name, rec] = entries[i++];
             remove_file(name);
             size -= rec.size_bytes;
             index.erase(name);
@@ -312,4 +354,4 @@ private:
     uint64_t next_lru_seq = 1;
 };
 
-} // namespace cert_helper::cache
+}  // namespace cert_helper::cache

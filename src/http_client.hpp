@@ -63,7 +63,7 @@
 //   ошибками между демоном и сервером; это — с локальной особенностью
 //   пула, которая с точки зрения "сеть работает или нет" вообще не
 //   является сбоем).
-//   Лимиты пула (kMaxIdleConnectionsPerHost/kMaxTotalIdleConnections) —
+//   Лимиты пула (MAX_IDLE_CONNECTIONS_PER_HOST/MAX_TOTAL_IDLE_CONNECTIONS) —
 //   фиксированные константы, не вынесены в CLI-флаги: это внутренний
 //   параметр производительности, а не что-то, что реально требует тюнинга
 //   в проде (в отличие от security-relevant лимитов вроде
@@ -74,6 +74,14 @@
 // возможная будущая замена (libcurl) не требовала правок request_router.
 
 #pragma once
+
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -90,22 +98,13 @@
 #include <unordered_map>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-#include <openssl/x509v3.h>
-
 #include "dns_cache.hpp"
 #include "logging.hpp"
 #include "net_policy.hpp"
 
 namespace cert_helper::http {
 
-enum class Method { Get, Post };
+enum class Method { GET, POST };
 
 // ПУНКТ 1 ИЗ АНАЛИЗА SQUID: уважать HTTP Cache-Control/Expires от самого
 // AIA/CRL/OCSP-сервера.
@@ -119,13 +118,15 @@ enum class Method { Get, Post };
 // сервер может только УКОРОТИТЬ наш TTL, никогда не удлинить его сверх
 // того, что мы и так сочли безопасным (nextUpdate/aia_ttl_seconds).
 struct CacheHints {
-    bool no_store = false;         // Cache-Control: no-store — не кэшировать вовсе
-    bool no_cache = false;         // Cache-Control: no-cache — трактуем консервативно как no-store
-                                    // (у демона нет condition GET/revalidation, поэтому
-                                    // "нельзя отдавать без ревалидации" эквивалентно
-                                    // "нельзя отдавать из кэша вообще" в нашей модели)
-    std::optional<int64_t> max_age_seconds; // Cache-Control: max-age=N
-    std::optional<int64_t> expires_unix;    // Expires: <HTTP-date>, разобранный в unix time
+    bool no_store = false;  // Cache-Control: no-store — не кэшировать вовсе
+    bool no_cache =
+        false;  // Cache-Control: no-cache — трактуем консервативно как no-store
+                // (у демона нет condition GET/revalidation, поэтому
+                // "нельзя отдавать без ревалидации" эквивалентно
+                // "нельзя отдавать из кэша вообще" в нашей модели)
+    std::optional<int64_t> max_age_seconds;  // Cache-Control: max-age=N
+    std::optional<int64_t>
+        expires_unix;  // Expires: <HTTP-date>, разобранный в unix time
 };
 
 // ROADMAP.md, раздел 4, пункт 23 (аудит-лог): причина, по которой запрос
@@ -135,24 +136,34 @@ struct CacheHints {
 // через URL из сертификата) от "сервер недоступен". None — обычный
 // исход: запрос дошёл до сети (успешно или с сетевой ошибкой).
 enum class FailureReason : uint8_t {
-    None = 0,
-    InvalidUrl,       // URL не разобран / неподдерживаемая схема
-    HttpsDisabled,    // https:// без --allow-https
-    HttpsUnavailable, // --allow-https, но хранилище доверенных CA не инициализировано
-    PortDenied,       // порт вне --allowed-ports
-    AddressDenied,    // все адреса резолва запрещены сетевой политикой (SSRF-защита)
-    CircuitOpen,      // выставляет RequestRouter: breaker хоста открыт, соединение не пытались
+    NONE = 0,
+    INVALID_URL,  // URL не разобран / неподдерживаемая схема
+    HTTPS_DISABLED,  // https:// без --allow-https
+    HTTPS_UNAVAILABLE,  // --allow-https, но хранилище доверенных CA не
+                        // инициализировано
+    PORT_DENIED,     // порт вне --allowed-ports
+    ADDRESS_DENIED,  // все адреса резолва запрещены сетевой политикой
+                     // (SSRF-защита)
+    CIRCUIT_OPEN,  // выставляет RequestRouter: breaker хоста открыт, соединение
+                   // не пытались
 };
 
-inline const char* failure_reason_name(FailureReason r) {
+inline char const* failure_reason_name(FailureReason r) {
     switch (r) {
-        case FailureReason::None: return "";
-        case FailureReason::InvalidUrl: return "invalid_url";
-        case FailureReason::HttpsDisabled: return "https_disabled";
-        case FailureReason::HttpsUnavailable: return "https_unavailable";
-        case FailureReason::PortDenied: return "port_denied";
-        case FailureReason::AddressDenied: return "address_denied";
-        case FailureReason::CircuitOpen: return "circuit_open";
+        case FailureReason::NONE:
+            return "";
+        case FailureReason::INVALID_URL:
+            return "invalid_url";
+        case FailureReason::HTTPS_DISABLED:
+            return "https_disabled";
+        case FailureReason::HTTPS_UNAVAILABLE:
+            return "https_unavailable";
+        case FailureReason::PORT_DENIED:
+            return "port_denied";
+        case FailureReason::ADDRESS_DENIED:
+            return "address_denied";
+        case FailureReason::CIRCUIT_OPEN:
+            return "circuit_open";
     }
     return "";
 }
@@ -163,7 +174,7 @@ struct HttpResult {
     std::vector<uint8_t> body;
     bool timed_out = false;
     CacheHints cache_hints;
-    FailureReason failure_reason = FailureReason::None;
+    FailureReason failure_reason = FailureReason::NONE;
 };
 
 class IHttpFetcher {
@@ -176,24 +187,50 @@ public:
     // (OCSP/AIA/CRL), не сам HTTP-клиент. Обязательный параметр, а не
     // значение по умолчанию — так вызывающая сторона не может случайно
     // забыть подумать о пределе для нового типа запроса.
-    virtual HttpResult fetch(Method method, const std::string& url,
-                              const std::vector<uint8_t>& post_body,
-                              const std::string& post_content_type,
-                              uint32_t timeout_ms,
-                              size_t max_response_bytes) = 0;
+    virtual HttpResult fetch(Method method, std::string const& url,
+                             std::vector<uint8_t> const& post_body,
+                             std::string const& post_content_type,
+                             uint32_t timeout_ms,
+                             size_t max_response_bytes) = 0;
 };
 
 // Разобранный http(s):// URL.
 struct ParsedUrl {
     std::string host;
     uint16_t port = 80;
-    std::string path; // включая query, без хоста
+    std::string path;  // включая query, без хоста
     bool is_https = false;
 };
 
-inline std::optional<ParsedUrl> parse_http_url(const std::string& url) {
-    const std::string http_prefix = "http://";
-    const std::string https_prefix = "https://";
+// ПУНКТ 2.2 ПЛАНА ДОРАБОТКИ (P0): URL, который разбирает эта функция,
+// приходит из AIA/CRL distribution point/OCSP responder поля
+// СЕРТИФИКАТА — то есть от третьей стороны, которой мы не доверяем.
+// host и path из распарсенного URL дальше конкатенируются прямо в
+// сырую HTTP-строку запроса (см. build_request() ниже) БЕЗ какого-либо
+// экранирования. Без этой проверки URL вида
+// "http://host/path HTTP/1.1\r\nX-Injected: evil\r\n\r\nGET /smuggled"
+// превращался в ДВА HTTP-запроса в одном TCP-соединении — классический
+// request smuggling (воспроизведено: сервер реально увидел второй,
+// "контрабандный" запрос). Запрещаем ЛЮБОЙ байт с кодом < 0x20 (это
+// покрывает \r, \n, \0 и остальные управляющие символы) и 0x7F (DEL) —
+// как в host, так и в path. Этого достаточно для устранения smuggling:
+// path здесь нигде не percent-декодируется (передаётся на сервер как
+// есть), поэтому "%0D%0A" остаётся шестью печатными ASCII-байтами, а не
+// настоящим CR/LF — экранировать percent-последовательности было бы
+// нужно, только если бы cert-helper сам декодировал path для своих
+// целей, а он этого не делает.
+inline bool has_control_byte(std::string const& s) {
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline std::optional<ParsedUrl> parse_http_url(std::string const& url) {
+    std::string const http_prefix = "http://";
+    std::string const https_prefix = "https://";
 
     bool is_https = false;
     std::string rest;
@@ -204,14 +241,22 @@ inline std::optional<ParsedUrl> parse_http_url(const std::string& url) {
         rest = url.substr(https_prefix.size());
         is_https = true;
     } else {
-        return std::nullopt; // ни http://, ни https:// — не поддерживаем
+        return std::nullopt;  // ни http://, ни https:// — не поддерживаем
     }
-    if (rest.empty()) return std::nullopt;
+    if (rest.empty()) {
+        return std::nullopt;
+    }
 
     size_t slash = rest.find('/');
-    std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+    std::string authority =
+        (slash == std::string::npos) ? rest : rest.substr(0, slash);
     std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
-    if (path.empty()) path = "/";
+    if (path.empty()) {
+        path = "/";
+    }
+    if (has_control_byte(authority) || has_control_byte(path)) {
+        return std::nullopt;
+    }
 
     ParsedUrl out;
     out.is_https = is_https;
@@ -222,12 +267,15 @@ inline std::optional<ParsedUrl> parse_http_url(const std::string& url) {
     } else {
         out.host = authority.substr(0, colon);
         try {
-            out.port = static_cast<uint16_t>(std::stoi(authority.substr(colon + 1)));
+            out.port =
+                static_cast<uint16_t>(std::stoi(authority.substr(colon + 1)));
         } catch (...) {
             return std::nullopt;
         }
     }
-    if (out.host.empty()) return std::nullopt;
+    if (out.host.empty()) {
+        return std::nullopt;
+    }
     out.path = path;
     return out;
 }
@@ -237,9 +285,13 @@ inline std::optional<ParsedUrl> parse_http_url(const std::string& url) {
 // соединений в первой версии), с таймаутом на подключение и на чтение.
 class SimpleHttpFetcher : public IHttpFetcher {
 public:
-    explicit SimpleHttpFetcher(net::NetworkPolicy policy, bool allow_https = false,
-                                std::string https_ca_bundle_path = "", uint32_t dns_cache_ttl_seconds = 60)
-        : policy(std::move(policy)), allow_https_(allow_https), dns_cache_(dns_cache_ttl_seconds) {
+    explicit SimpleHttpFetcher(net::NetworkPolicy policy,
+                               bool allow_https = false,
+                               std::string https_ca_bundle_path = "",
+                               uint32_t dns_cache_ttl_seconds = 60)
+        : policy(std::move(policy)),
+          allow_https(allow_https),
+          dns_cache(dns_cache_ttl_seconds) {
         // ROADMAP.md, раздел 1, пункт 7 (P2): SSL_CTX создаётся один раз в
         // конструкторе (не на каждый запрос) — создание контекста и
         // загрузка доверенного набора корневых сертификатов не бесплатны,
@@ -248,60 +300,66 @@ public:
         // модифицируем после этой точки). Создаём его, только если https
         // явно разрешён — иначе не тратим время на инициализацию TLS
         // вообще, раз он и так не будет использован.
-        if (allow_https_) {
-            https_ctx_.reset(create_https_ctx(https_ca_bundle_path));
-            if (!https_ctx_) {
+        if (allow_https) {
+            https_ctx.reset(create_https_ctx(https_ca_bundle_path));
+            if (!https_ctx) {
                 log::warn("http",
-                          "could not initialize TLS trust store for https:// support — "
+                          "could not initialize TLS trust store for https:// "
+                          "support — "
                           "все https:// запросы будут завершаться NetworkError",
-                          {log::field("trust_store", https_ca_bundle_path.empty()
-                                                         ? std::string("system (не найден)")
-                                                         : https_ca_bundle_path)});
+                          {log::field("trust_store",
+                                      https_ca_bundle_path.empty()
+                                          ? std::string("system (не найден)")
+                                          : https_ca_bundle_path)});
             }
         }
     }
 
-    HttpResult fetch(Method method, const std::string& url,
-                      const std::vector<uint8_t>& post_body,
-                      const std::string& post_content_type,
-                      uint32_t timeout_ms,
-                      size_t max_response_bytes) override {
+    HttpResult fetch(Method method, std::string const& url,
+                     std::vector<uint8_t> const& post_body,
+                     std::string const& post_content_type, uint32_t timeout_ms,
+                     size_t max_response_bytes) override {
         HttpResult result;
 
         auto parsed = parse_http_url(url);
         if (!parsed) {
-            result.failure_reason = FailureReason::InvalidUrl;
-            return result; // ok=false — вызывающий код трактует как NetworkError/InvalidResponse
+            result.failure_reason = FailureReason::INVALID_URL;
+            return result;  // ok=false — вызывающий код трактует как
+                            // NetworkError/InvalidResponse
         }
 
-        if (parsed->is_https && !allow_https_) {
+        if (parsed->is_https && !allow_https) {
             // ROADMAP.md, раздел 1, пункт 7: https:// выключен по
             // умолчанию — см. комментарий в начале файла. Проверяем ДО
             // connect_with_timeout(), чтобы демон даже не пытался
             // устанавливать соединение (не тратил время/файловые
             // дескрипторы на URL, который всё равно будет отклонён).
-            log::info("http", "https:// отключён по умолчанию, запрос отклонён (см. --allow-https)",
+            log::info("http",
+                      "https:// отключён по умолчанию, запрос отклонён (см. "
+                      "--allow-https)",
                       {log::field("url", url)});
-            result.failure_reason = FailureReason::HttpsDisabled;
+            result.failure_reason = FailureReason::HTTPS_DISABLED;
             return result;
         }
-        if (parsed->is_https && !https_ctx_) {
+        if (parsed->is_https && !https_ctx) {
             // allow_https=true, но SSL_CTX не удалось создать (см.
             // конструктор) — не деградируем до незашифрованного/
             // неверифицированного запроса, просто отказываем.
-            result.failure_reason = FailureReason::HttpsUnavailable;
+            result.failure_reason = FailureReason::HTTPS_UNAVAILABLE;
             return result;
         }
 
         if (!policy.is_port_allowed(parsed->port)) {
-            log::warn("http", "policy denied port",
-                      {log::field("port", parsed->port), log::field("url", url)});
-            result.failure_reason = FailureReason::PortDenied;
+            log::warn(
+                "http", "policy denied port",
+                {log::field("port", parsed->port), log::field("url", url)});
+            result.failure_reason = FailureReason::PORT_DENIED;
             return result;
         }
 
         std::string pool_key = make_pool_key(*parsed);
-        std::string request = build_request(method, *parsed, post_body, post_content_type);
+        std::string request =
+            build_request(method, *parsed, post_body, post_content_type);
 
         // ROADMAP.md, раздел 2, пункт 12 (P1): пробуем переиспользовать
         // простаивающее соединение из пула для этого host:port — см.
@@ -310,13 +368,16 @@ public:
         // внутри SimpleHttpFetcher).
         if (auto pooled = checkout_pooled_connection(pool_key)) {
             Transport transport{pooled->fd, pooled->ssl};
-            set_socket_timeout(pooled->fd, timeout_ms); // таймаут мог отличаться от прошлого использования
+            set_socket_timeout(pooled->fd,
+                               timeout_ms);  // таймаут мог отличаться от
+                                             // прошлого использования
 
             bool timed_out = false;
             bool should_close = true;
             std::optional<HttpResult> reused_result;
             if (send_all(transport, request)) {
-                reused_result = recv_and_parse_response(transport, max_response_bytes, timed_out, should_close);
+                reused_result = recv_and_parse_response(
+                    transport, max_response_bytes, timed_out, should_close);
             }
 
             if (reused_result) {
@@ -351,19 +412,25 @@ public:
             // этого блока.
         }
 
-        return fetch_over_new_connection(*parsed, pool_key, request, timeout_ms, max_response_bytes);
+        return fetch_over_new_connection(*parsed, pool_key, request, timeout_ms,
+                                         max_response_bytes);
     }
 
 private:
-    HttpResult fetch_over_new_connection(const ParsedUrl& parsed, const std::string& pool_key,
-                                          const std::string& request, uint32_t timeout_ms,
-                                          size_t max_response_bytes) {
+    HttpResult fetch_over_new_connection(ParsedUrl const& parsed,
+                                         std::string const& pool_key,
+                                         std::string const& request,
+                                         uint32_t timeout_ms,
+                                         size_t max_response_bytes) {
         HttpResult result;
 
         bool policy_denied = false;
-        int fd = connect_with_timeout(parsed.host, parsed.port, timeout_ms, policy, &policy_denied);
+        int fd = connect_with_timeout(parsed.host, parsed.port, timeout_ms,
+                                      policy, &policy_denied);
         if (fd < 0) {
-            if (policy_denied) result.failure_reason = FailureReason::AddressDenied;
+            if (policy_denied) {
+                result.failure_reason = FailureReason::ADDRESS_DENIED;
+            }
             return result;
         }
         set_socket_timeout(fd, timeout_ms);
@@ -376,7 +443,7 @@ private:
         std::unique_ptr<SSL, decltype(&SSL_free)> ssl_guard(nullptr, SSL_free);
         Transport transport{fd, nullptr};
         if (parsed.is_https) {
-            SSL* ssl = SSL_new(https_ctx_.get());
+            SSL* ssl = SSL_new(https_ctx.get());
             if (ssl == nullptr) {
                 ::close(fd);
                 return result;
@@ -405,7 +472,8 @@ private:
             // всё равно умеем отличить этот случай, делаем это правильно).
             X509_VERIFY_PARAM* vpm = SSL_get0_param(ssl);
             if (X509_VERIFY_PARAM_set1_ip_asc(vpm, parsed.host.c_str()) != 1) {
-                X509_VERIFY_PARAM_set1_host(vpm, parsed.host.c_str(), parsed.host.size());
+                X509_VERIFY_PARAM_set1_host(vpm, parsed.host.c_str(),
+                                            parsed.host.size());
             }
             SSL_set_verify(ssl, SSL_VERIFY_PEER, nullptr);
 
@@ -424,34 +492,41 @@ private:
 
         bool send_ok = send_all(transport, request);
         if (!send_ok) {
-            if (transport.ssl) SSL_shutdown(transport.ssl);
+            if (transport.ssl) {
+                SSL_shutdown(transport.ssl);
+            }
             ::close(fd);
             return result;
         }
 
         bool timed_out = false;
         bool should_close = true;
-        auto parsed_result = recv_and_parse_response(transport, max_response_bytes, timed_out, should_close);
+        auto parsed_result = recv_and_parse_response(
+            transport, max_response_bytes, timed_out, should_close);
 
         if (!parsed_result) {
-            if (transport.ssl) SSL_shutdown(transport.ssl);
+            if (transport.ssl) {
+                SSL_shutdown(transport.ssl);
+            }
             ::close(fd);
             result.timed_out = timed_out;
             return result;
         }
 
         if (should_close) {
-            if (transport.ssl) SSL_shutdown(transport.ssl);
+            if (transport.ssl) {
+                SSL_shutdown(transport.ssl);
+            }
             ::close(fd);
         } else {
             auto conn = std::make_unique<PooledConnection>();
             conn->fd = fd;
-            conn->ssl = ssl_guard.release(); // nullptr для http:// — release() на nullptr безопасен
+            conn->ssl = ssl_guard.release();  // nullptr для http:// — release()
+                                              // на nullptr безопасен
             return_pooled_connection(pool_key, std::move(conn));
         }
         return *parsed_result;
     }
-
 
     // Тонкая абстракция поверх "голого" fd и (опционально) TLS-сессии на
     // нём — позволяет send_all()/recv_all() ниже оставаться одним и тем
@@ -462,24 +537,32 @@ private:
         SSL* ssl;
     };
 
-    static ssize_t transport_send(Transport& t, const void* data, size_t len) {
-        if (t.ssl != nullptr) return SSL_write(t.ssl, data, static_cast<int>(len));
+    static ssize_t transport_send(Transport& t, void const* data, size_t len) {
+        if (t.ssl != nullptr) {
+            return SSL_write(t.ssl, data, static_cast<int>(len));
+        }
         return ::send(t.fd, data, len, MSG_NOSIGNAL);
     }
 
     // Возвращает >0 — прочитано N байт; 0 — чистое закрытие соединения
     // (EOF); <0 — ошибка/таймаут (out_timed_out выставляется отдельно).
-    static ssize_t transport_recv(Transport& t, void* buf, size_t len, bool& out_timed_out) {
+    static ssize_t transport_recv(Transport& t, void* buf, size_t len,
+                                  bool& out_timed_out) {
         if (t.ssl != nullptr) {
             int r = SSL_read(t.ssl, buf, static_cast<int>(len));
-            if (r > 0) return r;
+            if (r > 0) {
+                return r;
+            }
             int err = SSL_get_error(t.ssl, r);
-            if (err == SSL_ERROR_ZERO_RETURN) return 0; // TLS close_notify — чистое закрытие
-            if (err == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                return 0;  // TLS close_notify — чистое закрытие
+            }
+            if (err == SSL_ERROR_SYSCALL &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 out_timed_out = true;
                 return -1;
             }
-            return -1; // любая другая ошибка TLS-уровня
+            return -1;  // любая другая ошибка TLS-уровня
         }
         ssize_t r = ::recv(t.fd, buf, len, 0);
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -501,9 +584,11 @@ private:
     // системного набора, а не в дополнение к нему (иначе один
     // единственный скомпрометированный публичный CA в системном наборе
     // свёл бы на нет весь смысл указания приватного CA явно).
-    static SSL_CTX* create_https_ctx(const std::string& ca_bundle_path) {
+    static SSL_CTX* create_https_ctx(std::string const& ca_bundle_path) {
         SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-        if (ctx == nullptr) return nullptr;
+        if (ctx == nullptr) {
+            return nullptr;
+        }
 
         SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
@@ -512,7 +597,8 @@ private:
         if (ca_bundle_path.empty()) {
             trust_store_ok = (SSL_CTX_set_default_verify_paths(ctx) == 1);
         } else {
-            trust_store_ok = (SSL_CTX_load_verify_locations(ctx, ca_bundle_path.c_str(), nullptr) == 1);
+            trust_store_ok = (SSL_CTX_load_verify_locations(
+                                  ctx, ca_bundle_path.c_str(), nullptr) == 1);
         }
         if (!trust_store_ok) {
             SSL_CTX_free(ctx);
@@ -531,18 +617,23 @@ private:
     // пришёл ли адрес из кэша или свежего резолва — кэширование DNS не
     // должно давать способ обойти policy (см. подробное обоснование в
     // dns_cache.hpp).
-    int connect_with_timeout(const std::string& host, uint16_t port, uint32_t timeout_ms,
-                              const net::NetworkPolicy& policy, bool* policy_denied = nullptr) {
-        if (policy_denied != nullptr) *policy_denied = false;
-        auto addresses = dns_cache_.resolve(host);
+    int connect_with_timeout(std::string const& host, uint16_t port,
+                             uint32_t timeout_ms,
+                             net::NetworkPolicy const& policy,
+                             bool* policy_denied = nullptr) {
+        if (policy_denied != nullptr) {
+            *policy_denied = false;
+        }
+        auto addresses = dns_cache.resolve(host);
         if (addresses.empty()) {
             return -1;
         }
 
         int fd = -1;
         bool saw_policy_denial = false;
-        bool attempted_any = false; // хоть один адрес прошёл политику и мы пытались подключиться
-        for (const auto& addr : addresses) {
+        bool attempted_any = false;  // хоть один адрес прошёл политику и мы
+                                     // пытались подключиться
+        for (auto const& addr : addresses) {
             struct sockaddr_storage ss;
             socklen_t ss_len = 0;
             net::make_sockaddr(addr, port, ss, ss_len);
@@ -551,17 +642,21 @@ private:
             // фильтруем именно то, к чему реально собираемся подключиться,
             // так что политику нельзя обойти DNS rebinding (имя хоста,
             // которое выглядит безобидно, но резолвится в приватный IP).
-            if (!policy.is_address_allowed(reinterpret_cast<struct sockaddr*>(&ss))) {
+            if (!policy.is_address_allowed(
+                    reinterpret_cast<struct sockaddr*>(&ss))) {
                 saw_policy_denial = true;
                 continue;
             }
 
             attempted_any = true;
             fd = ::socket(addr.family, SOCK_STREAM, 0);
-            if (fd < 0) continue;
+            if (fd < 0) {
+                continue;
+            }
 
             set_socket_timeout(fd, timeout_ms);
-            if (::connect(fd, reinterpret_cast<struct sockaddr*>(&ss), ss_len) == 0) {
+            if (::connect(fd, reinterpret_cast<struct sockaddr*>(&ss),
+                          ss_len) == 0) {
                 break;
             }
             ::close(fd);
@@ -577,11 +672,12 @@ private:
                       "policy denied all resolved addresses "
                       "(possible SSRF attempt via certificate-supplied URL)",
                       {log::field("host", host)});
-            if (policy_denied != nullptr) *policy_denied = true;
+            if (policy_denied != nullptr) {
+                *policy_denied = true;
+            }
         }
         return fd;
     }
-
 
     static void set_socket_timeout(int fd, uint32_t timeout_ms) {
         struct timeval tv;
@@ -591,32 +687,37 @@ private:
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
-    static std::string build_request(Method method, const ParsedUrl& url,
-                                      const std::vector<uint8_t>& post_body,
-                                      const std::string& post_content_type) {
+    static std::string build_request(Method method, ParsedUrl const& url,
+                                     std::vector<uint8_t> const& post_body,
+                                     std::string const& post_content_type) {
         std::string req;
-        req += (method == Method::Get ? "GET " : "POST ");
+        req += (method == Method::GET ? "GET " : "POST ");
         req += url.path;
         req += " HTTP/1.1\r\n";
         req += "Host: " + url.host + "\r\n";
         req += "User-Agent: cert-helper/1.0\r\n";
-        req += "Connection: keep-alive\r\n"; // ROADMAP.md, раздел 2, пункт 12
-        if (method == Method::Post) {
+        req += "Connection: keep-alive\r\n";  // ROADMAP.md, раздел 2, пункт 12
+        if (method == Method::POST) {
             req += "Content-Type: " + post_content_type + "\r\n";
-            req += "Content-Length: " + std::to_string(post_body.size()) + "\r\n";
+            req +=
+                "Content-Length: " + std::to_string(post_body.size()) + "\r\n";
         }
         req += "Accept: */*\r\n\r\n";
-        if (method == Method::Post) {
-            req.append(reinterpret_cast<const char*>(post_body.data()), post_body.size());
+        if (method == Method::POST) {
+            req.append(reinterpret_cast<char const*>(post_body.data()),
+                       post_body.size());
         }
         return req;
     }
 
-    static bool send_all(Transport& transport, const std::string& data) {
+    static bool send_all(Transport& transport, std::string const& data) {
         size_t sent = 0;
         while (sent < data.size()) {
-            ssize_t w = transport_send(transport, data.data() + sent, data.size() - sent);
-            if (w < 0) return false;
+            ssize_t w = transport_send(transport, data.data() + sent,
+                                       data.size() - sent);
+            if (w < 0) {
+                return false;
+            }
             sent += static_cast<size_t>(w);
         }
         return true;
@@ -637,21 +738,53 @@ private:
         std::vector<uint8_t> decoded;
     };
 
-    static ChunkedParseResult try_decode_chunked_incremental(const std::string& body) {
+    static ChunkedParseResult try_decode_chunked_incremental(
+        std::string const& body, size_t max_response_bytes) {
         ChunkedParseResult result;
         size_t pos = 0;
         while (true) {
             size_t line_end = body.find("\r\n", pos);
-            if (line_end == std::string::npos) return result; // строка размера ещё не дочитана целиком
+            if (line_end == std::string::npos) {
+                return result;  // строка размера ещё не дочитана целиком
+            }
 
             std::string size_line = body.substr(pos, line_end - pos);
-            size_t semi = size_line.find(';'); // chunk-extensions отбрасываем
-            if (semi != std::string::npos) size_line = size_line.substr(0, semi);
+            size_t semi = size_line.find(';');  // chunk-extensions отбрасываем
+            if (semi != std::string::npos) {
+                size_line = size_line.substr(0, semi);
+            }
 
+            // ПУНКТ 2.3 ПЛАНА ДОРАБОТКИ (P0): chunk_size приходит от
+            // сервера, которому мы НЕ доверяем (AIA/OCSP/CDP URL взяты
+            // из сертификата третьей стороны). std::stoul() бросает
+            // исключение только при переполнении самого unsigned long
+            // (на 64-битной платформе это 64 бита — "ffffffffffffffff"
+            // успешно парсится, НЕ бросая исключение). Раньше ничто не
+            // мешало chunk_size быть произвольно огромным: проверка
+            // "data_start + chunk_size + 2 > body.size()" ниже сама
+            // переполняется при таких величинах (arithmetic overflow у
+            // size_t), из-за чего могла пропустить ранний выход — и код
+            // ниже формировал итератор на ~10^19 байт от буфера в
+            // несколько десятков байт (неопределённое поведение;
+            // воспроизведено как std::length_error из vector::insert
+            // под ASan, в Release — потенциальная порча памяти).
+            //
+            // Фикс — отклонять chunk_size как malformed СРАЗУ после
+            // парсинга, ДО какой-либо арифметики с ним, если он больше
+            // max_response_bytes: ни один НАСТОЯЩИЙ единичный chunk
+            // легитимного ответа не может быть больше заранее
+            // известного предела на весь ответ целиком. После этой
+            // проверки все дальнейшие вычисления с chunk_size гарантированно
+            // не переполняются size_t (оба слагаемых ограничены сверху
+            // разумным, некогда не огромным значением).
             size_t chunk_size;
             try {
                 chunk_size = std::stoul(size_line, nullptr, 16);
             } catch (...) {
+                result.malformed = true;
+                return result;
+            }
+            if (chunk_size > max_response_bytes) {
                 result.malformed = true;
                 return result;
             }
@@ -660,20 +793,28 @@ private:
             if (chunk_size == 0) {
                 // Терминирующий chunk: сразу за ним либо CRLF (без
                 // trailer-заголовков), либо trailer-заголовки + CRLF.
-                if (data_start + 2 > body.size()) return result;
+                if (data_start + 2 > body.size()) {
+                    return result;
+                }
                 if (body.compare(data_start, 2, "\r\n") == 0) {
                     result.complete = true;
                     return result;
                 }
                 size_t trailers_end = body.find("\r\n\r\n", data_start);
-                if (trailers_end == std::string::npos) return result; // trailers ещё не дочитаны целиком
+                if (trailers_end == std::string::npos) {
+                    return result;  // trailers ещё не дочитаны целиком
+                }
                 result.complete = true;
                 return result;
             }
 
-            if (data_start + chunk_size + 2 > body.size()) return result; // данные chunk'а ещё не все пришли
-            result.decoded.insert(result.decoded.end(), body.begin() + static_cast<long>(data_start),
-                                   body.begin() + static_cast<long>(data_start + chunk_size));
+            if (data_start + chunk_size + 2 > body.size()) {
+                return result;  // данные chunk'а ещё не все пришли
+            }
+            result.decoded.insert(
+                result.decoded.end(),
+                body.begin() + static_cast<long>(data_start),
+                body.begin() + static_cast<long>(data_start + chunk_size));
             if (body.compare(data_start + chunk_size, 2, "\r\n") != 0) {
                 result.malformed = true;
                 return result;
@@ -682,13 +823,16 @@ private:
         }
     }
 
-    static bool header_value_contains_ci(const std::string& header_block, const std::string& name,
-                                          const std::string& needle_lower) {
+    static bool header_value_contains_ci(std::string const& header_block,
+                                         std::string const& name,
+                                         std::string const& needle_lower) {
         auto value = find_header(header_block, name);
-        if (!value) return false;
+        if (!value) {
+            return false;
+        }
         std::string lower = *value;
         std::transform(lower.begin(), lower.end(), lower.begin(),
-                        [](unsigned char c) { return std::tolower(c); });
+                       [](unsigned char c) { return std::tolower(c); });
         return lower.find(needle_lower) != std::string::npos;
     }
 
@@ -706,32 +850,42 @@ private:
     // читать до EOF, соединение сервер и так уже закрыл), либо сервер
     // явно попросил "Connection: close", либо это HTTP/1.0 без
     // "Connection: keep-alive" (для HTTP/1.0 keep-alive не дефолтен).
-    static std::optional<HttpResult> recv_and_parse_response(Transport& transport,
-                                                               size_t max_response_bytes, bool& timed_out,
-                                                               bool& should_close) {
+    static std::optional<HttpResult> recv_and_parse_response(
+        Transport& transport, size_t max_response_bytes, bool& timed_out,
+        bool& should_close) {
         should_close = true;
 
         std::string buffer;
         size_t header_end = std::string::npos;
         while (header_end == std::string::npos) {
             char chunk[8192];
-            ssize_t r = transport_recv(transport, chunk, sizeof(chunk), timed_out);
-            if (r <= 0) return std::nullopt; // EOF/ошибка раньше, чем дочитали заголовки целиком
+            ssize_t r =
+                transport_recv(transport, chunk, sizeof(chunk), timed_out);
+            if (r <= 0) {
+                return std::nullopt;  // EOF/ошибка раньше, чем дочитали
+                                      // заголовки целиком
+            }
             buffer.append(chunk, static_cast<size_t>(r));
-            if (buffer.size() > max_response_bytes) return std::nullopt;
+            if (buffer.size() > max_response_bytes) {
+                return std::nullopt;
+            }
             header_end = buffer.find("\r\n\r\n");
         }
         std::string header_block = buffer.substr(0, header_end);
         std::string body_so_far = buffer.substr(header_end + 4);
 
         size_t first_line_end = header_block.find("\r\n");
-        std::string status_line =
-            (first_line_end == std::string::npos) ? header_block : header_block.substr(0, first_line_end);
+        std::string status_line = (first_line_end == std::string::npos)
+                                      ? header_block
+                                      : header_block.substr(0, first_line_end);
         size_t sp1 = status_line.find(' ');
-        if (sp1 == std::string::npos) return std::nullopt;
+        if (sp1 == std::string::npos) {
+            return std::nullopt;
+        }
         size_t sp2 = status_line.find(' ', sp1 + 1);
-        std::string code_str = (sp2 == std::string::npos) ? status_line.substr(sp1 + 1)
-                                                            : status_line.substr(sp1 + 1, sp2 - sp1 - 1);
+        std::string code_str = (sp2 == std::string::npos)
+                                   ? status_line.substr(sp1 + 1)
+                                   : status_line.substr(sp1 + 1, sp2 - sp1 - 1);
         int code = 0;
         try {
             code = std::stoi(code_str);
@@ -740,11 +894,16 @@ private:
         }
 
         bool http_1_0 = status_line.compare(0, 8, "HTTP/1.0") == 0;
-        bool connection_close = header_value_contains_ci(header_block, "Connection", "close");
-        bool connection_keep_alive = header_value_contains_ci(header_block, "Connection", "keep-alive");
-        bool may_reuse = !connection_close && !(http_1_0 && !connection_keep_alive);
-        bool chunked = header_value_contains_ci(header_block, "Transfer-Encoding", "chunked");
-        auto content_length_header = find_header(header_block, "Content-Length");
+        bool connection_close =
+            header_value_contains_ci(header_block, "Connection", "close");
+        bool connection_keep_alive =
+            header_value_contains_ci(header_block, "Connection", "keep-alive");
+        bool may_reuse =
+            !connection_close && !(http_1_0 && !connection_keep_alive);
+        bool chunked = header_value_contains_ci(header_block,
+                                                "Transfer-Encoding", "chunked");
+        auto content_length_header =
+            find_header(header_block, "Content-Length");
 
         HttpResult result;
         result.ok = true;
@@ -760,34 +919,54 @@ private:
             }
             while (body_so_far.size() < want) {
                 char chunk[8192];
-                ssize_t r = transport_recv(transport, chunk, sizeof(chunk), timed_out);
-                if (r <= 0) return std::nullopt;
+                ssize_t r =
+                    transport_recv(transport, chunk, sizeof(chunk), timed_out);
+                if (r <= 0) {
+                    return std::nullopt;
+                }
                 body_so_far.append(chunk, static_cast<size_t>(r));
-                if (header_block.size() + body_so_far.size() > max_response_bytes) return std::nullopt;
+                if (header_block.size() + body_so_far.size() >
+                    max_response_bytes) {
+                    return std::nullopt;
+                }
             }
             // Лишние байты сверх заявленного Content-Length — аномалия
             // (или сервер что-то допипелайнил, чего мы не поддерживаем):
             // используем только заявленную часть и не переиспользуем
             // соединение (should_close остаётся true).
-            result.body.assign(body_so_far.begin(), body_so_far.begin() + static_cast<long>(want));
-            if (body_so_far.size() == want && may_reuse) should_close = false;
+            result.body.assign(body_so_far.begin(),
+                               body_so_far.begin() + static_cast<long>(want));
+            if (body_so_far.size() == want && may_reuse) {
+                should_close = false;
+            }
             return result;
         }
 
         if (chunked) {
             while (true) {
-                auto attempt = try_decode_chunked_incremental(body_so_far);
-                if (attempt.malformed) return std::nullopt;
+                auto attempt = try_decode_chunked_incremental(
+                    body_so_far, max_response_bytes);
+                if (attempt.malformed) {
+                    return std::nullopt;
+                }
                 if (attempt.complete) {
                     result.body = std::move(attempt.decoded);
-                    if (may_reuse) should_close = false;
+                    if (may_reuse) {
+                        should_close = false;
+                    }
                     return result;
                 }
                 char chunk[8192];
-                ssize_t r = transport_recv(transport, chunk, sizeof(chunk), timed_out);
-                if (r <= 0) return std::nullopt;
+                ssize_t r =
+                    transport_recv(transport, chunk, sizeof(chunk), timed_out);
+                if (r <= 0) {
+                    return std::nullopt;
+                }
                 body_so_far.append(chunk, static_cast<size_t>(r));
-                if (header_block.size() + body_so_far.size() > max_response_bytes) return std::nullopt;
+                if (header_block.size() + body_so_far.size() >
+                    max_response_bytes) {
+                    return std::nullopt;
+                }
             }
         }
 
@@ -800,11 +979,18 @@ private:
         // здесь и не стоит.
         while (true) {
             char chunk[8192];
-            ssize_t r = transport_recv(transport, chunk, sizeof(chunk), timed_out);
-            if (r == 0) break; // EOF — тело получено целиком
-            if (r < 0) return std::nullopt;
+            ssize_t r =
+                transport_recv(transport, chunk, sizeof(chunk), timed_out);
+            if (r == 0) {
+                break;  // EOF — тело получено целиком
+            }
+            if (r < 0) {
+                return std::nullopt;
+            }
             body_so_far.append(chunk, static_cast<size_t>(r));
-            if (header_block.size() + body_so_far.size() > max_response_bytes) return std::nullopt;
+            if (header_block.size() + body_so_far.size() > max_response_bytes) {
+                return std::nullopt;
+            }
         }
         result.body.assign(body_so_far.begin(), body_so_far.end());
         return result;
@@ -813,26 +999,33 @@ private:
     // Регистронезависимый поиск значения заголовка "Name: value" внутри
     // блока заголовков (строки разделены \r\n). Возвращает значение без
     // окружающих пробелов, либо nullopt, если заголовок не встретился.
-    static std::optional<std::string> find_header(const std::string& header_block,
-                                                     const std::string& name) {
+    static std::optional<std::string> find_header(
+        std::string const& header_block, std::string const& name) {
         size_t pos = 0;
         while (pos < header_block.size()) {
             size_t line_end = header_block.find("\r\n", pos);
-            if (line_end == std::string::npos) line_end = header_block.size();
+            if (line_end == std::string::npos) {
+                line_end = header_block.size();
+            }
             std::string line = header_block.substr(pos, line_end - pos);
 
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
                 std::string key = line.substr(0, colon);
                 if (key.size() == name.size() &&
-                    std::equal(key.begin(), key.end(), name.begin(), [](char a, char b) {
-                        return std::tolower(static_cast<unsigned char>(a)) ==
-                               std::tolower(static_cast<unsigned char>(b));
-                    })) {
+                    std::equal(key.begin(), key.end(), name.begin(),
+                               [](char a, char b) {
+                                   return std::tolower(
+                                              static_cast<unsigned char>(a)) ==
+                                          std::tolower(
+                                              static_cast<unsigned char>(b));
+                               })) {
                     std::string value = line.substr(colon + 1);
                     size_t start = value.find_first_not_of(" \t");
                     size_t end = value.find_last_not_of(" \t");
-                    if (start == std::string::npos) return std::string();
+                    if (start == std::string::npos) {
+                        return std::string();
+                    }
                     return value.substr(start, end - start + 1);
                 }
             }
@@ -847,16 +1040,23 @@ private:
     // серверами; два устаревших формата из того же RFC умышленно не
     // поддерживаются ради простоты — при неудаче парсинга Expires просто
     // игнорируется, не являясь фатальной ошибкой).
-    static CacheHints parse_cache_hints(const std::string& header_block) {
+    static CacheHints parse_cache_hints(std::string const& header_block) {
         CacheHints hints;
 
         if (auto cache_control = find_header(header_block, "Cache-Control")) {
             std::string value = *cache_control;
             std::string lower = value;
-            for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (char& c : lower) {
+                c = static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(c)));
+            }
 
-            if (lower.find("no-store") != std::string::npos) hints.no_store = true;
-            if (lower.find("no-cache") != std::string::npos) hints.no_cache = true;
+            if (lower.find("no-store") != std::string::npos) {
+                hints.no_store = true;
+            }
+            if (lower.find("no-cache") != std::string::npos) {
+                hints.no_cache = true;
+            }
 
             size_t max_age_pos = lower.find("max-age");
             if (max_age_pos != std::string::npos) {
@@ -865,35 +1065,42 @@ private:
                     size_t num_start = eq + 1;
                     size_t num_end = num_start;
                     while (num_end < lower.size() &&
-                           (std::isdigit(static_cast<unsigned char>(lower[num_end])) ||
+                           (std::isdigit(
+                                static_cast<unsigned char>(lower[num_end])) ||
                             lower[num_end] == '-')) {
                         ++num_end;
                     }
                     try {
-                        int64_t max_age = std::stoll(lower.substr(num_start, num_end - num_start));
-                        if (max_age >= 0) hints.max_age_seconds = max_age;
-                        else hints.no_store = true; // отрицательный max-age трактуем как "не кэшировать"
+                        int64_t max_age = std::stoll(
+                            lower.substr(num_start, num_end - num_start));
+                        if (max_age >= 0) {
+                            hints.max_age_seconds = max_age;
+                        } else {
+                            hints.no_store =
+                                true;  // отрицательный max-age трактуем как "не
+                                       // кэшировать"
+                        }
                     } catch (...) {
-                        // не разобрали число — просто не выставляем max_age_seconds
+                        // не разобрали число — просто не выставляем
+                        // max_age_seconds
                     }
                 }
             }
         }
 
         if (auto expires = find_header(header_block, "Expires")) {
-            struct tm tm_val{};
+            struct tm tm_val {};
             // IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT"
-            if (strptime(expires->c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm_val) != nullptr) {
+            if (strptime(expires->c_str(), "%a, %d %b %Y %H:%M:%S GMT",
+                         &tm_val) != nullptr) {
                 time_t t = timegm(&tm_val);
-                if (t != static_cast<time_t>(-1)) hints.expires_unix = static_cast<int64_t>(t);
+                if (t != static_cast<time_t>(-1)) {
+                    hints.expires_unix = static_cast<int64_t>(t);
+                }
             }
         }
 
         return hints;
-    }
-
-    static std::vector<uint8_t> decode_chunked(const std::string& body) {
-        return try_decode_chunked_incremental(body).decoded;
     }
 
     // --- ROADMAP.md, раздел 2, пункт 12 (P1): пул простаивающих
@@ -910,7 +1117,9 @@ private:
                 SSL_shutdown(ssl);
                 SSL_free(ssl);
             }
-            if (fd >= 0) ::close(fd);
+            if (fd >= 0) {
+                ::close(fd);
+            }
         }
     };
 
@@ -920,41 +1129,53 @@ private:
     // security-relevant лимитов вроде max_response_bytes/max_retries,
     // которые вынесены в CLI-флаги). При необходимости несложно сделать
     // конфигурируемым позже — YAGNI на данный момент.
-    static constexpr size_t kMaxIdleConnectionsPerHost = 4;
-    static constexpr size_t kMaxTotalIdleConnections = 64;
+    static constexpr size_t MAX_IDLE_CONNECTIONS_PER_HOST = 4;
+    static constexpr size_t MAX_TOTAL_IDLE_CONNECTIONS = 64;
 
-    static std::string make_pool_key(const ParsedUrl& parsed) {
-        return (parsed.is_https ? std::string("https://") : std::string("http://")) + parsed.host + ":" +
-               std::to_string(parsed.port);
+    static std::string make_pool_key(ParsedUrl const& parsed) {
+        return (parsed.is_https ? std::string("https://")
+                                : std::string("http://")) +
+               parsed.host + ":" + std::to_string(parsed.port);
     }
 
-    std::unique_ptr<PooledConnection> checkout_pooled_connection(const std::string& key) {
-        std::lock_guard<std::mutex> lock(pool_mutex_);
-        auto it = idle_pool_.find(key);
-        if (it == idle_pool_.end() || it->second.empty()) return nullptr;
+    std::unique_ptr<PooledConnection> checkout_pooled_connection(
+        std::string const& key) {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        auto it = idle_pool.find(key);
+        if (it == idle_pool.end() || it->second.empty()) {
+            return nullptr;
+        }
         auto conn = std::move(it->second.back());
         it->second.pop_back();
         return conn;
     }
 
-    void return_pooled_connection(const std::string& key, std::unique_ptr<PooledConnection> conn) {
-        std::lock_guard<std::mutex> lock(pool_mutex_);
-        auto& vec = idle_pool_[key];
-        if (vec.size() >= kMaxIdleConnectionsPerHost) return; // conn уничтожится при выходе — закроет соединение
+    void return_pooled_connection(std::string const& key,
+                                  std::unique_ptr<PooledConnection> conn) {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        auto& vec = idle_pool[key];
+        if (vec.size() >= MAX_IDLE_CONNECTIONS_PER_HOST) {
+            return;  // conn уничтожится при выходе — закроет соединение
+        }
 
         size_t total = 0;
-        for (const auto& kv : idle_pool_) total += kv.second.size();
-        if (total >= kMaxTotalIdleConnections) return; // аналогично — просто закрываем лишнее
+        for (auto const& kv : idle_pool) {
+            total += kv.second.size();
+        }
+        if (total >= MAX_TOTAL_IDLE_CONNECTIONS) {
+            return;  // аналогично — просто закрываем лишнее
+        }
 
         vec.push_back(std::move(conn));
     }
 
     net::NetworkPolicy policy;
-    bool allow_https_ = false;
+    bool allow_https = false;
     // ROADMAP.md, раздел 1, пункт 7: nullptr, пока allow_https_ == false
     // (не тратим время на инициализацию TLS, который всё равно не будет
     // использован) — см. конструктор.
-    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> https_ctx_{nullptr, SSL_CTX_free};
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> https_ctx{nullptr,
+                                                                SSL_CTX_free};
 
     // ROADMAP.md, раздел 2, пункт 12: пул простаивающих соединений,
     // ключ — make_pool_key() (host:port, отдельно для http/https).
@@ -962,8 +1183,10 @@ private:
     // не время использования соединения — тот же принцип, что и у
     // остальных map-based структур в этом проекте (singleflight/circuit
     // breaker в request_router.hpp).
-    std::mutex pool_mutex_;
-    std::unordered_map<std::string, std::vector<std::unique_ptr<PooledConnection>>> idle_pool_;
+    std::mutex pool_mutex;
+    std::unordered_map<std::string,
+                       std::vector<std::unique_ptr<PooledConnection>>>
+        idle_pool;
 
     // ROADMAP.md, раздел 2, пункт 13: короткий локальный DNS-кэш — см.
     // dns_cache.hpp. Отдельный экземпляр на каждый SimpleHttpFetcher
@@ -971,7 +1194,7 @@ private:
     // SimpleLdapFetcher (у него свой), т.к. в реальном использовании
     // HTTP- и LDAP-хосты, как правило, разные, и делить кэш между ними
     // не даёт заметной выгоды при дополнительной сложности.
-    net::DnsCache dns_cache_;
+    net::DnsCache dns_cache;
 };
 
-} // namespace cert_helper::http
+}  // namespace cert_helper::http

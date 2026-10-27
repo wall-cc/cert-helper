@@ -53,6 +53,11 @@
 
 #pragma once
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -61,11 +66,6 @@
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "dns_cache.hpp"
 #include "logging.hpp"
@@ -95,7 +95,8 @@ inline std::vector<uint8_t> encode_length(size_t len) {
     return out;
 }
 
-inline std::vector<uint8_t> encode_tlv(uint8_t tag, const std::vector<uint8_t>& content) {
+inline std::vector<uint8_t> encode_tlv(uint8_t tag,
+                                       std::vector<uint8_t> const& content) {
     std::vector<uint8_t> out;
     out.push_back(tag);
     auto len = encode_length(content.size());
@@ -104,16 +105,18 @@ inline std::vector<uint8_t> encode_tlv(uint8_t tag, const std::vector<uint8_t>& 
     return out;
 }
 
-inline std::vector<uint8_t> encode_tlv(uint8_t tag, const std::string& content) {
-    return encode_tlv(tag, std::vector<uint8_t>(content.begin(), content.end()));
+inline std::vector<uint8_t> encode_tlv(uint8_t tag,
+                                       std::string const& content) {
+    return encode_tlv(tag,
+                      std::vector<uint8_t>(content.begin(), content.end()));
 }
 
-constexpr uint8_t kTagBoolean = 0x01;
-constexpr uint8_t kTagInteger = 0x02;
-constexpr uint8_t kTagOctetString = 0x04;
-constexpr uint8_t kTagEnumerated = 0x0A;
-constexpr uint8_t kTagSequence = 0x30;
-constexpr uint8_t kTagSet = 0x31;
+constexpr uint8_t TAG_BOOLEAN = 0x01;
+constexpr uint8_t TAG_INTEGER = 0x02;
+constexpr uint8_t TAG_OCTET_STRING = 0x04;
+constexpr uint8_t TAG_ENUMERATED = 0x0A;
+constexpr uint8_t TAG_SEQUENCE = 0x30;
+constexpr uint8_t TAG_SET = 0x31;
 
 inline std::vector<uint8_t> encode_integer(int64_t value) {
     std::vector<uint8_t> bytes;
@@ -125,28 +128,35 @@ inline std::vector<uint8_t> encode_integer(int64_t value) {
     if (value >= 0 && (bytes[0] & 0x80) != 0) {
         bytes.insert(bytes.begin(), 0x00);
     }
-    return encode_tlv(kTagInteger, bytes);
+    return encode_tlv(TAG_INTEGER, bytes);
 }
 
 inline std::vector<uint8_t> encode_enumerated(int value) {
     auto tlv = encode_integer(value);
-    tlv[0] = kTagEnumerated;
+    tlv[0] = TAG_ENUMERATED;
     return tlv;
 }
 
-inline std::vector<uint8_t> encode_octet_string(const std::string& s) { return encode_tlv(kTagOctetString, s); }
+inline std::vector<uint8_t> encode_octet_string(std::string const& s) {
+    return encode_tlv(TAG_OCTET_STRING, s);
+}
 
 inline std::vector<uint8_t> encode_boolean(bool b) {
-    return encode_tlv(kTagBoolean, std::vector<uint8_t>{static_cast<uint8_t>(b ? 0xFF : 0x00)});
+    return encode_tlv(TAG_BOOLEAN, std::vector<uint8_t>{
+                                       static_cast<uint8_t>(b ? 0xFF : 0x00)});
 }
 
-inline std::vector<uint8_t> encode_sequence(const std::vector<uint8_t>& content) {
-    return encode_tlv(kTagSequence, content);
+inline std::vector<uint8_t> encode_sequence(
+    std::vector<uint8_t> const& content) {
+    return encode_tlv(TAG_SEQUENCE, content);
 }
 
-inline std::vector<uint8_t> concat(std::initializer_list<std::vector<uint8_t>> parts) {
+inline std::vector<uint8_t> concat(
+    std::initializer_list<std::vector<uint8_t>> parts) {
     std::vector<uint8_t> out;
-    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    for (auto const& p : parts) {
+        out.insert(out.end(), p.begin(), p.end());
+    }
     return out;
 }
 
@@ -155,14 +165,19 @@ struct Tlv {
     std::vector<uint8_t> content;
 };
 
-inline std::optional<Tlv> try_read_tlv(const std::vector<uint8_t>& data, size_t pos, size_t& out_consumed,
-                                        bool& out_malformed) {
+inline std::optional<Tlv> try_read_tlv(std::vector<uint8_t> const& data,
+                                       size_t pos, size_t& out_consumed,
+                                       bool& out_malformed) {
     out_malformed = false;
-    if (pos >= data.size()) return std::nullopt;
+    if (pos >= data.size()) {
+        return std::nullopt;
+    }
 
     uint8_t tag = data[pos];
     size_t p = pos + 1;
-    if (p >= data.size()) return std::nullopt;
+    if (p >= data.size()) {
+        return std::nullopt;
+    }
 
     uint8_t first_len_byte = data[p];
     size_t len = 0;
@@ -179,7 +194,9 @@ inline std::optional<Tlv> try_read_tlv(const std::vector<uint8_t>& data, size_t 
             out_malformed = true;
             return std::nullopt;
         }
-        if (p + 1 + num_len_bytes > data.size()) return std::nullopt;
+        if (p + 1 + num_len_bytes > data.size()) {
+            return std::nullopt;
+        }
         len = 0;
         for (size_t i = 0; i < num_len_bytes; ++i) {
             len = (len << 8) | data[p + 1 + i];
@@ -192,40 +209,47 @@ inline std::optional<Tlv> try_read_tlv(const std::vector<uint8_t>& data, size_t 
         out_malformed = true;
         return std::nullopt;
     }
-    if (data.size() < pos + header_size + len) return std::nullopt;
+    if (data.size() < pos + header_size + len) {
+        return std::nullopt;
+    }
 
     Tlv tlv;
     tlv.tag = tag;
-    tlv.content.assign(data.begin() + pos + header_size, data.begin() + pos + header_size + len);
+    tlv.content.assign(data.begin() + pos + header_size,
+                       data.begin() + pos + header_size + len);
     out_consumed = header_size + len;
     return tlv;
 }
 
-inline std::vector<Tlv> parse_children(const std::vector<uint8_t>& content) {
+inline std::vector<Tlv> parse_children(std::vector<uint8_t> const& content) {
     std::vector<Tlv> out;
     size_t pos = 0;
     while (pos < content.size()) {
         size_t consumed = 0;
         bool malformed = false;
         auto tlv = try_read_tlv(content, pos, consumed, malformed);
-        if (!tlv || malformed) break;
+        if (!tlv || malformed) {
+            break;
+        }
         out.push_back(*tlv);
         pos += consumed;
     }
     return out;
 }
 
-inline int64_t decode_integer(const std::vector<uint8_t>& content) {
+inline int64_t decode_integer(std::vector<uint8_t> const& content) {
     int64_t value = 0;
-    for (uint8_t b : content) value = (value << 8) | b;
+    for (uint8_t b : content) {
+        value = (value << 8) | b;
+    }
     return value;
 }
 
-inline std::string decode_octet_string(const std::vector<uint8_t>& content) {
+inline std::string decode_octet_string(std::vector<uint8_t> const& content) {
     return std::string(content.begin(), content.end());
 }
 
-} // namespace ber
+}  // namespace ber
 
 struct ParsedLdapUrl {
     std::string host;
@@ -237,11 +261,12 @@ struct ParsedLdapUrl {
 
 namespace detail {
 
-inline std::string percent_decode(const std::string& s) {
+inline std::string percent_decode(std::string const& s) {
     std::string out;
     out.reserve(s.size());
     for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '%' && i + 2 < s.size() && std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
+        if (s[i] == '%' && i + 2 < s.size() &&
+            std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
             std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
             std::string hex = s.substr(i + 1, 2);
             out.push_back(static_cast<char>(std::stoi(hex, nullptr, 16)));
@@ -253,9 +278,11 @@ inline std::string percent_decode(const std::string& s) {
     return out;
 }
 
-inline std::vector<std::string> split(const std::string& s, char delim) {
+inline std::vector<std::string> split(std::string const& s, char delim) {
     std::vector<std::string> out;
-    if (s.empty()) return out;
+    if (s.empty()) {
+        return out;
+    }
     size_t start = 0;
     while (true) {
         size_t pos = s.find(delim, start);
@@ -269,20 +296,24 @@ inline std::vector<std::string> split(const std::string& s, char delim) {
     return out;
 }
 
-} // namespace detail
+}  // namespace detail
 
-inline std::optional<ParsedLdapUrl> parse_ldap_url(const std::string& url) {
-    const std::string prefix = "ldap://";
-    if (url.compare(0, prefix.size(), prefix) != 0) return std::nullopt;
+inline std::optional<ParsedLdapUrl> parse_ldap_url(std::string const& url) {
+    std::string const prefix = "ldap://";
+    if (url.compare(0, prefix.size(), prefix) != 0) {
+        return std::nullopt;
+    }
     std::string rest = url.substr(prefix.size());
 
     size_t slash = rest.find('/');
-    std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
-    std::string tail = (slash == std::string::npos) ? "" : rest.substr(slash + 1);
+    std::string authority =
+        (slash == std::string::npos) ? rest : rest.substr(0, slash);
+    std::string tail =
+        (slash == std::string::npos) ? "" : rest.substr(slash + 1);
 
     ParsedLdapUrl out;
     if (authority.empty()) {
-        return std::nullopt; // пустой host — см. ограничения в начале файла
+        return std::nullopt;  // пустой host — см. ограничения в начале файла
     }
     size_t colon = authority.find(':');
     if (colon == std::string::npos) {
@@ -291,15 +322,20 @@ inline std::optional<ParsedLdapUrl> parse_ldap_url(const std::string& url) {
     } else {
         out.host = authority.substr(0, colon);
         try {
-            out.port = static_cast<uint16_t>(std::stoi(authority.substr(colon + 1)));
+            out.port =
+                static_cast<uint16_t>(std::stoi(authority.substr(colon + 1)));
         } catch (...) {
             return std::nullopt;
         }
     }
-    if (out.host.empty()) return std::nullopt;
+    if (out.host.empty()) {
+        return std::nullopt;
+    }
 
     auto parts = detail::split(tail, '?');
-    if (!parts.empty()) out.dn = detail::percent_decode(parts[0]);
+    if (!parts.empty()) {
+        out.dn = detail::percent_decode(parts[0]);
+    }
     if (parts.size() >= 2 && !parts[1].empty()) {
         for (auto& a : detail::split(parts[1], ',')) {
             out.attributes.push_back(detail::percent_decode(a));
@@ -316,32 +352,47 @@ inline std::optional<ParsedLdapUrl> parse_ldap_url(const std::string& url) {
 
 namespace filter {
 
-inline std::optional<std::vector<uint8_t>> encode(const std::string& s, size_t& pos);
+inline std::optional<std::vector<uint8_t>> encode(std::string const& s,
+                                                  size_t& pos);
 
-inline std::optional<std::vector<uint8_t>> encode_list(const std::string& s, size_t& pos) {
+inline std::optional<std::vector<uint8_t>> encode_list(std::string const& s,
+                                                       size_t& pos) {
     std::vector<uint8_t> out;
     bool any = false;
     while (pos < s.size() && s[pos] == '(') {
         auto child = encode(s, pos);
-        if (!child) return std::nullopt;
+        if (!child) {
+            return std::nullopt;
+        }
         out.insert(out.end(), child->begin(), child->end());
         any = true;
     }
-    if (!any) return std::nullopt;
+    if (!any) {
+        return std::nullopt;
+    }
     return out;
 }
 
-inline std::optional<std::vector<uint8_t>> encode(const std::string& s, size_t& pos) {
-    if (pos >= s.size() || s[pos] != '(') return std::nullopt;
+inline std::optional<std::vector<uint8_t>> encode(std::string const& s,
+                                                  size_t& pos) {
+    if (pos >= s.size() || s[pos] != '(') {
+        return std::nullopt;
+    }
     ++pos;
-    if (pos >= s.size()) return std::nullopt;
+    if (pos >= s.size()) {
+        return std::nullopt;
+    }
 
     char c = s[pos];
     if (c == '&' || c == '|') {
         ++pos;
         auto list = encode_list(s, pos);
-        if (!list) return std::nullopt;
-        if (pos >= s.size() || s[pos] != ')') return std::nullopt;
+        if (!list) {
+            return std::nullopt;
+        }
+        if (pos >= s.size() || s[pos] != ')') {
+            return std::nullopt;
+        }
         ++pos;
         uint8_t tag = 0x80 | 0x20 | (c == '&' ? 0x00 : 0x01);
         return ber::encode_tlv(tag, *list);
@@ -349,47 +400,66 @@ inline std::optional<std::vector<uint8_t>> encode(const std::string& s, size_t& 
     if (c == '!') {
         ++pos;
         auto child = encode(s, pos);
-        if (!child) return std::nullopt;
-        if (pos >= s.size() || s[pos] != ')') return std::nullopt;
+        if (!child) {
+            return std::nullopt;
+        }
+        if (pos >= s.size() || s[pos] != ')') {
+            return std::nullopt;
+        }
         ++pos;
         uint8_t tag = 0x80 | 0x20 | 0x02;
         return ber::encode_tlv(tag, *child);
     }
 
     size_t close = s.find(')', pos);
-    if (close == std::string::npos) return std::nullopt;
+    if (close == std::string::npos) {
+        return std::nullopt;
+    }
     std::string clause = s.substr(pos, close - pos);
     pos = close + 1;
 
     size_t eq = clause.find('=');
-    if (eq == std::string::npos) return std::nullopt;
-    if (eq > 0 && (clause[eq - 1] == '>' || clause[eq - 1] == '<' || clause[eq - 1] == '~')) {
+    if (eq == std::string::npos) {
+        return std::nullopt;
+    }
+    if (eq > 0 && (clause[eq - 1] == '>' || clause[eq - 1] == '<' ||
+                   clause[eq - 1] == '~')) {
         return std::nullopt;
     }
     std::string attr = clause.substr(0, eq);
     std::string value = clause.substr(eq + 1);
-    if (attr.empty()) return std::nullopt;
+    if (attr.empty()) {
+        return std::nullopt;
+    }
 
     if (value == "*") {
         uint8_t tag = 0x80 | 0x07;
         return ber::encode_tlv(tag, attr);
     }
-    if (value.find('*') != std::string::npos) return std::nullopt;
+    if (value.find('*') != std::string::npos) {
+        return std::nullopt;
+    }
 
     uint8_t tag = 0x80 | 0x20 | 0x03;
-    auto inner = ber::concat({ber::encode_octet_string(attr), ber::encode_octet_string(value)});
+    auto inner = ber::concat(
+        {ber::encode_octet_string(attr), ber::encode_octet_string(value)});
     return ber::encode_tlv(tag, inner);
 }
 
-inline std::optional<std::vector<uint8_t>> encode_top_level(const std::string& s) {
+inline std::optional<std::vector<uint8_t>> encode_top_level(
+    std::string const& s) {
     size_t pos = 0;
     auto result = encode(s, pos);
-    if (!result) return std::nullopt;
-    if (pos != s.size()) return std::nullopt;
+    if (!result) {
+        return std::nullopt;
+    }
+    if (pos != s.size()) {
+        return std::nullopt;
+    }
     return result;
 }
 
-} // namespace filter
+}  // namespace filter
 
 struct LdapResult {
     bool ok = false;
@@ -403,54 +473,65 @@ struct LdapResult {
 class ILdapFetcher {
 public:
     virtual ~ILdapFetcher() = default;
-    virtual LdapResult fetch(const std::string& url, const std::string& attribute_name, uint32_t timeout_ms,
-                              size_t max_response_bytes) = 0;
+    virtual LdapResult fetch(std::string const& url,
+                             std::string const& attribute_name,
+                             uint32_t timeout_ms,
+                             size_t max_response_bytes) = 0;
 };
 
 namespace detail {
 
 inline std::string strip_attr_options_lower(std::string s) {
     size_t semi = s.find(';');
-    if (semi != std::string::npos) s = s.substr(0, semi);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (semi != std::string::npos) {
+        s = s.substr(0, semi);
+    }
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
     return s;
 }
 
-inline bool attrs_match(const std::string& a, const std::string& b) {
+inline bool attrs_match(std::string const& a, std::string const& b) {
     return strip_attr_options_lower(a) == strip_attr_options_lower(b);
 }
 
-} // namespace detail
+}  // namespace detail
 
 class SimpleLdapFetcher : public ILdapFetcher {
 public:
-    explicit SimpleLdapFetcher(net::NetworkPolicy policy, uint32_t dns_cache_ttl_seconds = 60)
-        : policy_(std::move(policy)), dns_cache_(dns_cache_ttl_seconds) {}
+    explicit SimpleLdapFetcher(net::NetworkPolicy policy,
+                               uint32_t dns_cache_ttl_seconds = 60)
+        : policy(std::move(policy)), dns_cache(dns_cache_ttl_seconds) {}
 
-    LdapResult fetch(const std::string& url, const std::string& attribute_name, uint32_t timeout_ms,
-                      size_t max_response_bytes) override {
+    LdapResult fetch(std::string const& url, std::string const& attribute_name,
+                     uint32_t timeout_ms, size_t max_response_bytes) override {
         LdapResult result;
 
         auto parsed = parse_ldap_url(url);
-        if (!parsed) return result;
+        if (!parsed) {
+            return result;
+        }
 
         auto filter_ber = filter::encode_top_level(parsed->filter);
         if (!filter_ber) {
             log::warn("ldap",
-                      "не поддерживаемая конструкция LDAP-фильтра (см. ограничения в ldap_client.hpp)",
+                      "не поддерживаемая конструкция LDAP-фильтра (см. "
+                      "ограничения в ldap_client.hpp)",
                       {log::field("url", url)});
             return result;
         }
 
-        if (!policy_.is_port_allowed(parsed->port)) {
-            log::warn("ldap", "policy denied port",
-                      {log::field("port", parsed->port), log::field("url", url)});
+        if (!policy.is_port_allowed(parsed->port)) {
+            log::warn(
+                "ldap", "policy denied port",
+                {log::field("port", parsed->port), log::field("url", url)});
             result.policy_denied = true;
             return result;
         }
 
         bool all_addresses_denied = false;
-        int fd = connect_with_timeout(parsed->host, parsed->port, timeout_ms, policy_, &all_addresses_denied);
+        int fd = connect_with_timeout(parsed->host, parsed->port, timeout_ms,
+                                      policy, &all_addresses_denied);
         if (fd < 0) {
             result.policy_denied = all_addresses_denied;
             return result;
@@ -458,7 +539,8 @@ public:
         set_socket_timeout(fd, timeout_ms);
 
         bool ok = do_bind(fd, timeout_ms, max_response_bytes) &&
-                  do_search(fd, *parsed, *filter_ber, attribute_name, timeout_ms, max_response_bytes, result);
+                  do_search(fd, *parsed, *filter_ber, attribute_name,
+                            timeout_ms, max_response_bytes, result);
 
         send_unbind(fd);
         ::close(fd);
@@ -468,38 +550,51 @@ public:
     }
 
 private:
-    net::NetworkPolicy policy_;
+    net::NetworkPolicy policy;
     // ROADMAP.md, раздел 2, пункт 13: см. подробное обоснование в
     // dns_cache.hpp и в http_client.hpp (SimpleHttpFetcher::dns_cache_) —
     // отдельный экземпляр, не разделяется с SimpleHttpFetcher.
-    net::DnsCache dns_cache_;
+    net::DnsCache dns_cache;
 
     // Больше не static — нужен доступ к dns_cache_ как члену экземпляра.
     // policy.is_address_allowed() по-прежнему вызывается для КАЖДОГО
     // адреса при КАЖДОМ вызове, вне зависимости от того, пришёл ли он из
     // кэша — см. dns_cache.hpp про то, почему это критично для безопасности.
-    int connect_with_timeout(const std::string& host, uint16_t port, uint32_t timeout_ms,
-                              const net::NetworkPolicy& policy, bool* all_addresses_denied = nullptr) {
-        if (all_addresses_denied != nullptr) *all_addresses_denied = false;
-        auto addresses = dns_cache_.resolve(host);
-        if (addresses.empty()) return -1;
+    int connect_with_timeout(std::string const& host, uint16_t port,
+                             uint32_t timeout_ms,
+                             net::NetworkPolicy const& policy,
+                             bool* all_addresses_denied = nullptr) {
+        if (all_addresses_denied != nullptr) {
+            *all_addresses_denied = false;
+        }
+        auto addresses = dns_cache.resolve(host);
+        if (addresses.empty()) {
+            return -1;
+        }
 
         int fd = -1;
         bool saw_policy_denial = false;
-        bool attempted_any = false; // хоть один адрес прошёл политику и мы пытались подключиться
-        for (const auto& addr : addresses) {
+        bool attempted_any = false;  // хоть один адрес прошёл политику и мы
+                                     // пытались подключиться
+        for (auto const& addr : addresses) {
             struct sockaddr_storage ss;
             socklen_t ss_len = 0;
             net::make_sockaddr(addr, port, ss, ss_len);
-            if (!policy.is_address_allowed(reinterpret_cast<struct sockaddr*>(&ss))) {
+            if (!policy.is_address_allowed(
+                    reinterpret_cast<struct sockaddr*>(&ss))) {
                 saw_policy_denial = true;
                 continue;
             }
             attempted_any = true;
             fd = ::socket(addr.family, SOCK_STREAM, 0);
-            if (fd < 0) continue;
+            if (fd < 0) {
+                continue;
+            }
             set_socket_timeout(fd, timeout_ms);
-            if (::connect(fd, reinterpret_cast<struct sockaddr*>(&ss), ss_len) == 0) break;
+            if (::connect(fd, reinterpret_cast<struct sockaddr*>(&ss),
+                          ss_len) == 0) {
+                break;
+            }
             ::close(fd);
             fd = -1;
         }
@@ -511,7 +606,9 @@ private:
                       "policy denied all resolved addresses "
                       "(possible SSRF attempt via certificate-supplied URL)",
                       {log::field("host", host)});
-            if (all_addresses_denied != nullptr) *all_addresses_denied = true;
+            if (all_addresses_denied != nullptr) {
+                *all_addresses_denied = true;
+            }
         }
         return fd;
     }
@@ -524,57 +621,77 @@ private:
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
-    static bool send_all(int fd, const std::vector<uint8_t>& data) {
+    static bool send_all(int fd, std::vector<uint8_t> const& data) {
         size_t sent = 0;
         while (sent < data.size()) {
-            ssize_t w = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
-            if (w < 0) return false;
+            ssize_t w = ::send(fd, data.data() + sent, data.size() - sent,
+                               MSG_NOSIGNAL);
+            if (w < 0) {
+                return false;
+            }
             sent += static_cast<size_t>(w);
         }
         return true;
     }
 
-    static std::optional<std::vector<uint8_t>> recv_one_message(int fd, std::vector<uint8_t>& buffer,
-                                                                  size_t& total_received,
-                                                                  size_t max_response_bytes) {
+    static std::optional<std::vector<uint8_t>> recv_one_message(
+        int fd, std::vector<uint8_t>& buffer, size_t& total_received,
+        size_t max_response_bytes) {
         while (true) {
             size_t consumed = 0;
             bool malformed = false;
             auto tlv = ber::try_read_tlv(buffer, 0, consumed, malformed);
-            if (malformed) return std::nullopt;
+            if (malformed) {
+                return std::nullopt;
+            }
             if (tlv) {
-                std::vector<uint8_t> message(buffer.begin(), buffer.begin() + consumed);
+                std::vector<uint8_t> message(buffer.begin(),
+                                             buffer.begin() + consumed);
                 buffer.erase(buffer.begin(), buffer.begin() + consumed);
                 return message;
             }
 
             char chunk[4096];
             ssize_t r = ::recv(fd, chunk, sizeof(chunk), 0);
-            if (r <= 0) return std::nullopt;
+            if (r <= 0) {
+                return std::nullopt;
+            }
             total_received += static_cast<size_t>(r);
-            if (total_received > max_response_bytes) return std::nullopt;
+            if (total_received > max_response_bytes) {
+                return std::nullopt;
+            }
             buffer.insert(buffer.end(), chunk, chunk + r);
         }
     }
 
-    static bool parse_ldap_message(const std::vector<uint8_t>& raw, int64_t& out_message_id,
-                                    uint8_t& out_op_tag, std::vector<uint8_t>& out_op_content) {
+    static bool parse_ldap_message(std::vector<uint8_t> const& raw,
+                                   int64_t& out_message_id, uint8_t& out_op_tag,
+                                   std::vector<uint8_t>& out_op_content) {
         size_t consumed = 0;
         bool malformed = false;
         auto top = ber::try_read_tlv(raw, 0, consumed, malformed);
-        if (!top || malformed || top->tag != ber::kTagSequence) return false;
+        if (!top || malformed || top->tag != ber::TAG_SEQUENCE) {
+            return false;
+        }
         auto children = ber::parse_children(top->content);
-        if (children.size() < 2) return false;
-        if (children[0].tag != ber::kTagInteger) return false;
+        if (children.size() < 2) {
+            return false;
+        }
+        if (children[0].tag != ber::TAG_INTEGER) {
+            return false;
+        }
         out_message_id = ber::decode_integer(children[0].content);
         out_op_tag = children[1].tag;
         out_op_content = children[1].content;
         return true;
     }
 
-    static bool parse_ldap_result_code(const std::vector<uint8_t>& op_content, int64_t& out_result_code) {
+    static bool parse_ldap_result_code(std::vector<uint8_t> const& op_content,
+                                       int64_t& out_result_code) {
         auto children = ber::parse_children(op_content);
-        if (children.empty() || children[0].tag != ber::kTagEnumerated) return false;
+        if (children.empty() || children[0].tag != ber::TAG_ENUMERATED) {
+            return false;
+        }
         out_result_code = ber::decode_integer(children[0].content);
         return true;
     }
@@ -585,39 +702,54 @@ private:
             ber::encode_octet_string(""),
             ber::encode_tlv(0x80, std::string()),
         });
-        constexpr uint8_t kTagBindRequest = 0x60;
-        auto protocol_op = ber::encode_tlv(kTagBindRequest, bind_body);
-        auto message = ber::encode_sequence(ber::concat({ber::encode_integer(1), protocol_op}));
-        if (!send_all(fd, message)) return false;
+        constexpr uint8_t tag_bind_request = 0x60;
+        auto protocol_op = ber::encode_tlv(tag_bind_request, bind_body);
+        auto message = ber::encode_sequence(
+            ber::concat({ber::encode_integer(1), protocol_op}));
+        if (!send_all(fd, message)) {
+            return false;
+        }
 
         std::vector<uint8_t> buffer;
         size_t total_received = 0;
-        auto raw = recv_one_message(fd, buffer, total_received, max_response_bytes);
-        if (!raw) return false;
+        auto raw =
+            recv_one_message(fd, buffer, total_received, max_response_bytes);
+        if (!raw) {
+            return false;
+        }
 
         int64_t message_id = 0;
         uint8_t op_tag = 0;
         std::vector<uint8_t> op_content;
-        if (!parse_ldap_message(*raw, message_id, op_tag, op_content)) return false;
-        constexpr uint8_t kTagBindResponse = 0x61;
-        if (op_tag != kTagBindResponse || message_id != 1) return false;
+        if (!parse_ldap_message(*raw, message_id, op_tag, op_content)) {
+            return false;
+        }
+        constexpr uint8_t tag_bind_response = 0x61;
+        if (op_tag != tag_bind_response || message_id != 1) {
+            return false;
+        }
 
         int64_t result_code = -1;
-        if (!parse_ldap_result_code(op_content, result_code)) return false;
+        if (!parse_ldap_result_code(op_content, result_code)) {
+            return false;
+        }
         return result_code == 0;
     }
 
-    bool do_search(int fd, const ParsedLdapUrl& parsed, const std::vector<uint8_t>& filter_ber,
-                    const std::string& attribute_name, uint32_t timeout_ms, size_t max_response_bytes,
-                    LdapResult& out_result) {
+    bool do_search(int fd, ParsedLdapUrl const& parsed,
+                   std::vector<uint8_t> const& filter_ber,
+                   std::string const& attribute_name, uint32_t timeout_ms,
+                   size_t max_response_bytes, LdapResult& out_result) {
         std::vector<uint8_t> attrs_seq_content;
-        for (const auto& a : parsed.attributes) {
+        for (auto const& a : parsed.attributes) {
             auto attr = ber::encode_octet_string(a);
-            attrs_seq_content.insert(attrs_seq_content.end(), attr.begin(), attr.end());
+            attrs_seq_content.insert(attrs_seq_content.end(), attr.begin(),
+                                     attr.end());
         }
         if (parsed.attributes.empty()) {
             auto attr = ber::encode_octet_string(attribute_name);
-            attrs_seq_content.insert(attrs_seq_content.end(), attr.begin(), attr.end());
+            attrs_seq_content.insert(attrs_seq_content.end(), attr.begin(),
+                                     attr.end());
         }
 
         auto search_body = ber::concat({
@@ -630,33 +762,46 @@ private:
             filter_ber,
             ber::encode_sequence(attrs_seq_content),
         });
-        constexpr uint8_t kTagSearchRequest = 0x63;
-        auto protocol_op = ber::encode_tlv(kTagSearchRequest, search_body);
-        auto message = ber::encode_sequence(ber::concat({ber::encode_integer(2), protocol_op}));
-        if (!send_all(fd, message)) return false;
+        constexpr uint8_t tag_search_request = 0x63;
+        auto protocol_op = ber::encode_tlv(tag_search_request, search_body);
+        auto message = ber::encode_sequence(
+            ber::concat({ber::encode_integer(2), protocol_op}));
+        if (!send_all(fd, message)) {
+            return false;
+        }
 
-        constexpr uint8_t kTagSearchResultEntry = 0x64;
-        constexpr uint8_t kTagSearchResultDone = 0x65;
-        constexpr uint8_t kTagSearchResultReference = 0x73;
+        constexpr uint8_t tag_search_result_entry = 0x64;
+        constexpr uint8_t tag_search_result_done = 0x65;
+        constexpr uint8_t tag_search_result_reference = 0x73;
 
         std::vector<uint8_t> buffer;
         size_t total_received = 0;
         bool found_value = false;
 
         while (true) {
-            auto raw = recv_one_message(fd, buffer, total_received, max_response_bytes);
-            if (!raw) return false;
+            auto raw = recv_one_message(fd, buffer, total_received,
+                                        max_response_bytes);
+            if (!raw) {
+                return false;
+            }
 
             int64_t message_id = 0;
             uint8_t op_tag = 0;
             std::vector<uint8_t> op_content;
-            if (!parse_ldap_message(*raw, message_id, op_tag, op_content)) return false;
-            if (message_id != 2) continue;
+            if (!parse_ldap_message(*raw, message_id, op_tag, op_content)) {
+                return false;
+            }
+            if (message_id != 2) {
+                continue;
+            }
 
-            if (op_tag == kTagSearchResultReference) continue;
-            if (op_tag == kTagSearchResultEntry) {
+            if (op_tag == tag_search_result_reference) {
+                continue;
+            }
+            if (op_tag == tag_search_result_entry) {
                 if (!found_value) {
-                    auto value = extract_attribute_value(op_content, attribute_name);
+                    auto value =
+                        extract_attribute_value(op_content, attribute_name);
                     if (value) {
                         out_result.value = std::move(*value);
                         found_value = true;
@@ -664,38 +809,52 @@ private:
                 }
                 continue;
             }
-            if (op_tag == kTagSearchResultDone) {
+            if (op_tag == tag_search_result_done) {
                 int64_t result_code = -1;
-                if (!parse_ldap_result_code(op_content, result_code)) return false;
+                if (!parse_ldap_result_code(op_content, result_code)) {
+                    return false;
+                }
                 return result_code == 0;
             }
             return false;
         }
     }
 
-    static std::optional<std::vector<uint8_t>> extract_attribute_value(const std::vector<uint8_t>& entry_content,
-                                                                          const std::string& attribute_name) {
+    static std::optional<std::vector<uint8_t>> extract_attribute_value(
+        std::vector<uint8_t> const& entry_content,
+        std::string const& attribute_name) {
         auto top_children = ber::parse_children(entry_content);
-        if (top_children.size() < 2) return std::nullopt;
+        if (top_children.size() < 2) {
+            return std::nullopt;
+        }
         auto attributes = ber::parse_children(top_children[1].content);
-        for (const auto& attr_tlv : attributes) {
+        for (auto const& attr_tlv : attributes) {
             auto attr_fields = ber::parse_children(attr_tlv.content);
-            if (attr_fields.size() < 2) continue;
-            std::string type_name = ber::decode_octet_string(attr_fields[0].content);
-            if (!detail::attrs_match(type_name, attribute_name)) continue;
+            if (attr_fields.size() < 2) {
+                continue;
+            }
+            std::string type_name =
+                ber::decode_octet_string(attr_fields[0].content);
+            if (!detail::attrs_match(type_name, attribute_name)) {
+                continue;
+            }
             auto values = ber::parse_children(attr_fields[1].content);
-            if (values.empty()) continue;
+            if (values.empty()) {
+                continue;
+            }
             return values[0].content;
         }
         return std::nullopt;
     }
 
     void send_unbind(int fd) {
-        constexpr uint8_t kTagUnbindRequest = 0x42;
-        auto protocol_op = ber::encode_tlv(kTagUnbindRequest, std::vector<uint8_t>{});
-        auto message = ber::encode_sequence(ber::concat({ber::encode_integer(3), protocol_op}));
+        constexpr uint8_t tag_unbind_request = 0x42;
+        auto protocol_op =
+            ber::encode_tlv(tag_unbind_request, std::vector<uint8_t>{});
+        auto message = ber::encode_sequence(
+            ber::concat({ber::encode_integer(3), protocol_op}));
         send_all(fd, message);
     }
 };
 
-} // namespace cert_helper::ldap
+}  // namespace cert_helper::ldap

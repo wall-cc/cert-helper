@@ -9,6 +9,10 @@
 //      blocked + reason, серийный номер OCSP, батчи). Роутер тестируется
 //      с фейковым HTTP-фетчером и in-memory кэшем — без сети и D-Bus.
 
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -21,10 +25,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "../src/audit_log.hpp"
 #include "../src/request_router.hpp"
@@ -51,26 +51,34 @@ struct TempDir {
         path = p != nullptr ? p : "";
     }
     ~TempDir() {
-        if (!path.empty()) fs::remove_all(path);
+        if (!path.empty()) {
+            fs::remove_all(path);
+        }
     }
-    std::string file(const std::string& name) const { return path + "/" + name; }
+    std::string file(std::string const& name) const {
+        return path + "/" + name;
+    }
 };
 
-std::vector<std::string> read_lines(const std::string& path) {
+std::vector<std::string> read_lines(std::string const& path) {
     std::vector<std::string> lines;
     std::ifstream in(path);
     std::string line;
-    while (std::getline(in, line)) lines.push_back(line);
+    while (std::getline(in, line)) {
+        lines.push_back(line);
+    }
     return lines;
 }
 
 // Достаёт значение поля из СТРОКИ НАШЕГО ЖЕ формата (плоский объект, без
 // вложенности). Строковые значения возвращаются как есть, в экранированном
 // виде — этого достаточно для проверок; полноценный JSON-парсер тут не нужен.
-std::string jget(const std::string& line, const std::string& key) {
-    const std::string needle = "\"" + key + "\":";
+std::string jget(std::string const& line, std::string const& key) {
+    std::string const needle = "\"" + key + "\":";
     size_t p = line.find(needle);
-    if (p == std::string::npos) return "";
+    if (p == std::string::npos) {
+        return "";
+    }
     p += needle.size();
     if (p < line.size() && line[p] == '"') {
         ++p;
@@ -90,7 +98,7 @@ std::string jget(const std::string& line, const std::string& key) {
     return line.substr(p, e - p);
 }
 
-bool jhas(const std::string& line, const std::string& key) {
+bool jhas(std::string const& line, std::string const& key) {
     return line.find("\"" + key + "\":") != std::string::npos;
 }
 
@@ -100,12 +108,17 @@ struct LogCapture {
     std::vector<std::string> lines;
     LogCapture() {
         lg::Logger::instance().reset();
-        lg::Logger::instance().set_line_writer([this](const std::string& l) { lines.push_back(l); });
+        lg::Logger::instance().set_line_writer(
+            [this](std::string const& l) { lines.push_back(l); });
     }
     ~LogCapture() { lg::Logger::instance().reset(); }
-    int count_containing(const std::string& needle) const {
+    int count_containing(std::string const& needle) const {
         int n = 0;
-        for (const auto& l : lines) if (l.find(needle) != std::string::npos) ++n;
+        for (auto const& l : lines) {
+            if (l.find(needle) != std::string::npos) {
+                ++n;
+            }
+        }
         return n;
     }
 };
@@ -114,33 +127,41 @@ struct LogCapture {
 // Часть 1: FileAuditLog
 // ---------------------------------------------------------------------------
 
-constexpr int64_t kFixedMs = 1767323045678LL; // 2026-01-02T03:04:05.678Z
+constexpr int64_t FIXED_MS = 1767323045678LL;  // 2026-01-02T03:04:05.678Z
 
 void test_format_audit_line_exact() {
     std::string line = audit::format_audit_line(
-        kFixedMs, 42, "fetch",
-        {lg::field("type", "crl"), lg::field("bytes", uint64_t{1830}), lg::field("ok", true)});
-    TEST_CHECK_EQ(line, std::string("{\"ts\":\"2026-01-02T03:04:05.678Z\",\"seq\":42,\"event\":\"fetch\","
-                                    "\"type\":\"crl\",\"bytes\":1830,\"ok\":true}"));
+        FIXED_MS, 42, "fetch",
+        {lg::field("type", "crl"), lg::field("bytes", uint64_t{1830}),
+         lg::field("ok", true)});
+    TEST_CHECK_EQ(line,
+                  std::string("{\"ts\":\"2026-01-02T03:04:05.678Z\",\"seq\":42,"
+                              "\"event\":\"fetch\","
+                              "\"type\":\"crl\",\"bytes\":1830,\"ok\":true}"));
 }
 
 // URL из сертификата с кавычками/переводами строк не должен ни сломать
 // JSON, ни породить вторую строку журнала.
 void test_format_audit_line_escapes_untrusted_values() {
     std::string line = audit::format_audit_line(
-        kFixedMs, 1, "fetch",
-        {lg::field("url", "http://e/\"},{\"seq\":999,\"event\":\"fake\n{\"x\":1"), lg::field("bad", "a\xffz")});
+        FIXED_MS, 1, "fetch",
+        {lg::field("url",
+                   "http://e/\"},{\"seq\":999,\"event\":\"fake\n{\"x\":1"),
+         lg::field("bad", "a\xffz")});
     TEST_CHECK(line.find('\n') == std::string::npos);
     TEST_CHECK(line.find("\\ufffd") != std::string::npos);
-    // Внедрённый фрагмент остался внутри строкового значения (кавычки экранированы).
+    // Внедрённый фрагмент остался внутри строкового значения (кавычки
+    // экранированы).
     TEST_CHECK(line.find("\\\"},{\\\"seq\\\":999") != std::string::npos);
-    TEST_CHECK_EQ(jget(line, "seq"), std::string("1")); // настоящий seq не подменён
+    TEST_CHECK_EQ(jget(line, "seq"),
+                  std::string("1"));  // настоящий seq не подменён
 }
 
 void test_format_audit_line_reserved_keys_are_renamed() {
     std::string line = audit::format_audit_line(
-        kFixedMs, 7, "fetch",
-        {lg::field("seq", "hijack"), lg::field("ts", "hijack"), lg::field("event", "hijack")});
+        FIXED_MS, 7, "fetch",
+        {lg::field("seq", "hijack"), lg::field("ts", "hijack"),
+         lg::field("event", "hijack")});
     TEST_CHECK_EQ(jget(line, "seq"), std::string("7"));
     TEST_CHECK_EQ(jget(line, "event"), std::string("fetch"));
     TEST_CHECK_EQ(jget(line, "seq_"), std::string("hijack"));
@@ -168,19 +189,21 @@ void test_file_log_writes_jsonl_with_sequential_seq() {
         TEST_CHECK_EQ(jget(lines[0], "pid"), std::string("123"));
         TEST_CHECK_EQ(jget(lines[1], "type"), std::string("aia"));
         TEST_CHECK_EQ(jget(lines[2], "event"), std::string("daemon_stop"));
-        for (const auto& l : lines) {
+        for (auto const& l : lines) {
             TEST_CHECK(l.front() == '{' && l.back() == '}');
-            TEST_CHECK_EQ(jget(l, "ts").size(), size_t{24}); // 2026-01-02T03:04:05.678Z
+            TEST_CHECK_EQ(jget(l, "ts").size(),
+                          size_t{24});  // 2026-01-02T03:04:05.678Z
         }
     }
     TEST_CHECK_EQ(audit_log.write_failures(), uint64_t{0});
 }
 
 // Append-only: новый экземпляр (рестарт демона) дописывает в конец, а не
-// затирает журнал; seq при этом начинается с 1 — границу запуска задаёт daemon_start.
+// затирает журнал; seq при этом начинается с 1 — границу запуска задаёт
+// daemon_start.
 void test_file_log_appends_across_restarts_and_never_truncates() {
     TempDir dir;
-    const std::string path = dir.file("audit.log");
+    std::string const path = dir.file("audit.log");
     {
         audit::FileAuditLog first({path, false});
         TEST_CHECK(first.open());
@@ -220,35 +243,36 @@ void test_file_log_open_failures_are_reported() {
     {
         // O_NOFOLLOW: не идём по symlink'у (иначе тот, кто может создать
         // ссылку в каталоге журнала, перенаправил бы запись куда угодно).
-        const std::string target = dir.file("target.log");
+        std::string const target = dir.file("target.log");
         { std::ofstream(target) << "precious\n"; }
         fs::create_symlink(target, dir.file("link.log"));
         audit::FileAuditLog via_link({dir.file("link.log"), false});
         std::string err;
         TEST_CHECK(!via_link.open(&err));
         TEST_CHECK(!err.empty());
-        TEST_CHECK_EQ(read_lines(target).size(), size_t{1}); // цель не тронута
+        TEST_CHECK_EQ(read_lines(target).size(), size_t{1});  // цель не тронута
     }
 }
 
 void test_file_log_is_created_with_restrictive_mode() {
     TempDir dir;
-    mode_t old_umask = ::umask(0); // чтобы проверить именно запрошенный режим
+    mode_t old_umask = ::umask(0);  // чтобы проверить именно запрошенный режим
     {
         audit::FileAuditLog audit_log({dir.file("audit.log"), false});
         TEST_CHECK(audit_log.open());
     }
     ::umask(old_umask);
-    struct stat st{};
+    struct stat st {};
     TEST_CHECK_EQ(::stat(dir.file("audit.log").c_str(), &st), 0);
-    TEST_CHECK_EQ(static_cast<int>(st.st_mode & 0777), 0640); // не world-readable
+    TEST_CHECK_EQ(static_cast<int>(st.st_mode & 0777),
+                  0640);  // не world-readable
 }
 
 // Ротация logrotate'ом (rename + create) без SIGHUP: демон сам замечает
 // смену inode и пишет в НОВЫЙ файл, а не продолжает дописывать в ротированный.
 void test_file_log_follows_rotation_by_rename() {
     TempDir dir;
-    const std::string path = dir.file("audit.log");
+    std::string const path = dir.file("audit.log");
     audit::FileAuditLog audit_log({path, false});
     TEST_CHECK(audit_log.open());
 
@@ -261,16 +285,18 @@ void test_file_log_follows_rotation_by_rename() {
     TEST_CHECK_EQ(rotated.size(), size_t{1});
     TEST_CHECK_EQ(fresh.size(), size_t{1});
     if (rotated.size() == 1 && fresh.size() == 1) {
-        TEST_CHECK_EQ(jget(rotated[0], "event"), std::string("before_rotation"));
+        TEST_CHECK_EQ(jget(rotated[0], "event"),
+                      std::string("before_rotation"));
         TEST_CHECK_EQ(jget(fresh[0], "event"), std::string("after_rotation"));
-        TEST_CHECK_EQ(jget(fresh[0], "seq"), std::string("2")); // нумерация сквозная через ротацию
+        TEST_CHECK_EQ(jget(fresh[0], "seq"),
+                      std::string("2"));  // нумерация сквозная через ротацию
     }
     TEST_CHECK_EQ(audit_log.write_failures(), uint64_t{0});
 }
 
 void test_file_log_recreates_deleted_file() {
     TempDir dir;
-    const std::string path = dir.file("audit.log");
+    std::string const path = dir.file("audit.log");
     audit::FileAuditLog audit_log({path, false});
     TEST_CHECK(audit_log.open());
     audit_log.record("one", {});
@@ -279,12 +305,15 @@ void test_file_log_recreates_deleted_file() {
 
     auto lines = read_lines(path);
     TEST_CHECK_EQ(lines.size(), size_t{1});
-    if (lines.size() == 1) TEST_CHECK_EQ(jget(lines[0], "event"), std::string("two"));
+    if (lines.size() == 1) {
+        TEST_CHECK_EQ(jget(lines[0], "event"), std::string("two"));
+    }
 }
 
 void test_file_log_fsync_mode_writes_normally() {
     TempDir dir;
-    audit::FileAuditLog audit_log({dir.file("audit.log"), /*fsync_each_event=*/true});
+    audit::FileAuditLog audit_log(
+        {dir.file("audit.log"), /*fsync_each_event=*/true});
     TEST_CHECK(audit_log.open());
     audit_log.record("durable", {lg::field("n", 1)});
     auto lines = read_lines(dir.file("audit.log"));
@@ -300,35 +329,46 @@ void test_file_log_concurrent_records_are_intact_and_ordered() {
     audit::FileAuditLog audit_log({dir.file("audit.log"), false});
     TEST_CHECK(audit_log.open());
 
-    constexpr int kThreads = 8;
-    constexpr int kPerThread = 100;
+    constexpr int THREAD_COUNT = 8;
+    constexpr int MESSAGES_PER_THREAD = 100;
     std::vector<std::thread> threads;
-    for (int t = 0; t < kThreads; ++t) {
+    for (int t = 0; t < THREAD_COUNT; ++t) {
         threads.emplace_back([&audit_log, t] {
-            for (int i = 0; i < kPerThread; ++i) {
-                audit_log.record("fetch", {lg::field("thread", t), lg::field("i", i),
-                                           lg::field("url", "http://ca.example.test/x.crl")});
+            for (int i = 0; i < MESSAGES_PER_THREAD; ++i) {
+                audit_log.record(
+                    "fetch",
+                    {lg::field("thread", t), lg::field("i", i),
+                     lg::field("url", "http://ca.example.test/x.crl")});
             }
         });
     }
-    for (auto& th : threads) th.join();
+    for (auto& th : threads) {
+        th.join();
+    }
 
     auto lines = read_lines(dir.file("audit.log"));
-    TEST_CHECK_EQ(lines.size(), static_cast<size_t>(kThreads * kPerThread));
+    TEST_CHECK_EQ(lines.size(),
+                  static_cast<size_t>(THREAD_COUNT * MESSAGES_PER_THREAD));
     bool well_formed = true;
     bool ordered = true;
     long prev = 0;
     std::map<int, int> per_thread;
-    for (const auto& l : lines) {
-        if (l.rfind("{\"ts\":\"", 0) != 0 || l.back() != '}') well_formed = false;
+    for (auto const& l : lines) {
+        if (l.rfind("{\"ts\":\"", 0) != 0 || l.back() != '}') {
+            well_formed = false;
+        }
         long seq = std::stol(jget(l, "seq"));
-        if (seq != prev + 1) ordered = false;
+        if (seq != prev + 1) {
+            ordered = false;
+        }
         prev = seq;
         ++per_thread[std::stoi(jget(l, "thread"))];
     }
     TEST_CHECK(well_formed);
     TEST_CHECK(ordered);
-    for (int t = 0; t < kThreads; ++t) TEST_CHECK_EQ(per_thread[t], kPerThread);
+    for (int t = 0; t < THREAD_COUNT; ++t) {
+        TEST_CHECK_EQ(per_thread[t], MESSAGES_PER_THREAD);
+    }
     TEST_CHECK_EQ(audit_log.write_failures(), uint64_t{0});
 }
 
@@ -340,44 +380,52 @@ void test_file_log_concurrent_records_are_intact_and_ordered() {
 // детерминированно и без прав root.
 void test_file_log_write_failure_is_counted_reported_once_and_recovers() {
     TempDir dir;
-    const std::string path = dir.file("audit.log");
+    std::string const path = dir.file("audit.log");
     LogCapture cap;
 
     audit::FileAuditLog audit_log({path, false});
     TEST_CHECK(audit_log.open());
     audit_log.record("ok_before", {});
-    const auto size_before = fs::file_size(path);
+    auto const size_before = fs::file_size(path);
 
-    struct rlimit old_limit{};
+    struct rlimit old_limit {};
     ::getrlimit(RLIMIT_FSIZE, &old_limit);
-    auto old_handler = std::signal(SIGXFSZ, SIG_IGN); // иначе процесс убьёт сигнал, а не write() вернёт EFBIG
+    auto old_handler = std::signal(
+        SIGXFSZ,
+        SIG_IGN);  // иначе процесс убьёт сигнал, а не write() вернёт EFBIG
     std::fflush(stdout);
     std::fflush(stderr);
 
     struct rlimit tight = old_limit;
-    tight.rlim_cur = size_before + 20; // меньше одной строки: первая запись оборвётся посередине
+    tight.rlim_cur =
+        size_before +
+        20;  // меньше одной строки: первая запись оборвётся посередине
     ::setrlimit(RLIMIT_FSIZE, &tight);
     audit_log.record("lost_1", {lg::field("url", "http://ca.example.test/a")});
     audit_log.record("lost_2", {lg::field("url", "http://ca.example.test/b")});
     audit_log.record("lost_3", {lg::field("url", "http://ca.example.test/c")});
-    ::setrlimit(RLIMIT_FSIZE, &old_limit); // "диск освободился"
+    ::setrlimit(RLIMIT_FSIZE, &old_limit);  // "диск освободился"
 
     audit_log.record("ok_after", {});
     std::signal(SIGXFSZ, old_handler);
 
     TEST_CHECK_EQ(audit_log.write_failures(), uint64_t{3});
-    TEST_CHECK_EQ(cap.count_containing("audit log write failed"), 1);   // не на каждое событие
+    TEST_CHECK_EQ(cap.count_containing("audit log write failed"),
+                  1);  // не на каждое событие
     TEST_CHECK_EQ(cap.count_containing("audit log writes recovered"), 1);
 
     auto lines = read_lines(path);
     bool found_before = false, found_after = false;
-    for (const auto& l : lines) {
-        if (jget(l, "event") == "ok_before") found_before = true;
+    for (auto const& l : lines) {
+        if (jget(l, "event") == "ok_before") {
+            found_before = true;
+        }
         if (jget(l, "event") == "ok_after") {
             found_after = true;
             // Пропуск в нумерации: 1 (ok_before), 2..4 потеряны, 5 — ok_after.
             TEST_CHECK_EQ(jget(l, "seq"), std::string("5"));
-            TEST_CHECK(l.rfind("{\"ts\":\"", 0) == 0); // строка целая, не склеена с огрызком
+            TEST_CHECK(l.rfind("{\"ts\":\"", 0) ==
+                       0);  // строка целая, не склеена с огрызком
         }
     }
     TEST_CHECK(found_before);
@@ -390,34 +438,43 @@ void test_file_log_write_failure_is_counted_reported_once_and_recovers() {
 
 class MemoryCache : public cache::ICacheStore {
 public:
-    std::optional<cache::CacheEntry> get(cache::EntryKind kind, const std::string& key) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = entries_.find(std::to_string(static_cast<int>(kind)) + "|" + key);
-        if (it == entries_.end()) return std::nullopt;
-        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-        if (it->second.valid_until <= now) return std::nullopt;
+    std::optional<cache::CacheEntry> get(cache::EntryKind kind,
+                                         std::string const& key) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it =
+            entries.find(std::to_string(static_cast<int>(kind)) + "|" + key);
+        if (it == entries.end()) {
+            return std::nullopt;
+        }
+        int64_t const now =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        if (it->second.valid_until <= now) {
+            return std::nullopt;
+        }
         return it->second;
     }
-    void put(cache::EntryKind kind, const std::string& key, const cache::CacheEntry& entry) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        entries_[std::to_string(static_cast<int>(kind)) + "|" + key] = entry;
+    void put(cache::EntryKind kind, std::string const& key,
+             cache::CacheEntry const& entry) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        entries[std::to_string(static_cast<int>(kind)) + "|" + key] = entry;
     }
     cache::CacheStats stats() override { return {}; }
 
 private:
-    std::mutex mutex_;
-    std::map<std::string, cache::CacheEntry> entries_;
+    std::mutex mutex;
+    std::map<std::string, cache::CacheEntry> entries;
 };
 
 class FakeHttpFetcher : public http::IHttpFetcher {
 public:
-    std::function<http::HttpResult(const std::string& url)> on_fetch;
+    std::function<http::HttpResult(std::string const& url)> on_fetch;
     std::atomic<int> calls{0};
 
-    http::HttpResult fetch(http::Method, const std::string& url, const std::vector<uint8_t>&,
-                           const std::string&, uint32_t, size_t) override {
+    http::HttpResult fetch(http::Method, std::string const& url,
+                           std::vector<uint8_t> const&, std::string const&,
+                           uint32_t, size_t) override {
         ++calls;
         return on_fetch(url);
     }
@@ -426,7 +483,8 @@ public:
 class FakeLdapFetcher : public cert_helper::ldap::ILdapFetcher {
 public:
     cert_helper::ldap::LdapResult result;
-    cert_helper::ldap::LdapResult fetch(const std::string&, const std::string&, uint32_t, size_t) override {
+    cert_helper::ldap::LdapResult fetch(std::string const&, std::string const&,
+                                        uint32_t, size_t) override {
         return result;
     }
 };
@@ -435,40 +493,53 @@ struct Captured {
     std::string event;
     std::vector<lg::Field> fields;
 
-    bool has(const std::string& key) const {
-        for (const auto& f : fields) if (f.key == key) return true;
+    bool has(std::string const& key) const {
+        for (auto const& f : fields) {
+            if (f.key == key) {
+                return true;
+            }
+        }
         return false;
     }
-    std::string get(const std::string& key) const {
-        for (const auto& f : fields) if (f.key == key) return f.value;
+    std::string get(std::string const& key) const {
+        for (auto const& f : fields) {
+            if (f.key == key) {
+                return f.value;
+            }
+        }
         return "";
     }
 };
 
 class MemorySink : public audit::IAuditSink {
 public:
-    void record(std::string_view event, const std::vector<lg::Field>& fields) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        events_.push_back(Captured{std::string(event), fields});
+    void record(std::string_view event,
+                std::vector<lg::Field> const& fields) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        captured_events.push_back(Captured{std::string(event), fields});
     }
     std::vector<Captured> events() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return events_;
+        std::lock_guard<std::mutex> lock(mutex);
+        return captured_events;
     }
-    int count_decision(const std::string& decision) {
+    int count_decision(std::string const& decision) {
         int n = 0;
-        for (const auto& e : events()) if (e.get("decision") == decision) ++n;
+        for (auto const& e : events()) {
+            if (e.get("decision") == decision) {
+                ++n;
+            }
+        }
         return n;
     }
 
 private:
-    std::mutex mutex_;
-    std::vector<Captured> events_;
+    std::mutex mutex;
+    std::vector<Captured> captured_events;
 };
 
 class ThrowingSink : public audit::IAuditSink {
 public:
-    void record(std::string_view, const std::vector<lg::Field>&) override {
+    void record(std::string_view, std::vector<lg::Field> const&) override {
         throw std::runtime_error("audit backend exploded");
     }
 };
@@ -481,7 +552,8 @@ http::HttpResult ok_result(std::vector<uint8_t> body, int status = 200) {
     return r;
 }
 
-http::HttpResult failed_result(http::FailureReason reason = http::FailureReason::None) {
+http::HttpResult failed_result(
+    http::FailureReason reason = http::FailureReason::NONE) {
     http::HttpResult r;
     r.ok = false;
     r.failure_reason = reason;
@@ -490,29 +562,33 @@ http::HttpResult failed_result(http::FailureReason reason = http::FailureReason:
 
 cert_helper::RequestRouter::Config fast_config() {
     cert_helper::RequestRouter::Config c;
-    c.max_retries = 0; // без backoff — тесты не должны спать
+    c.max_retries = 0;  // без backoff — тесты не должны спать
     c.circuit_breaker_failure_threshold = 1000;
     return c;
 }
 
-// Сеть -> кэш: первый запрос network_fetch с http_status и размером, второй — cache_hit.
+// Сеть -> кэш: первый запрос network_fetch с http_status и размером, второй —
+// cache_hit.
 void test_router_audits_network_fetch_then_cache_hit() {
     MemoryCache cache;
     FakeHttpFetcher http;
     MemorySink sink;
-    const auto cert = test_util::generate_self_signed_cert_der("aia-audit", -1, 365);
-    http.on_fetch = [&](const std::string&) { return ok_result(cert); };
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &sink);
+    auto const cert =
+        test_util::generate_self_signed_cert_der("aia-audit", -1, 365);
+    http.on_fetch = [&](std::string const&) { return ok_result(cert); };
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &sink);
 
     proto::FetchIntermediateCertRequest req;
     req.aia_url = "http://ca.example.test/issuer.cer";
-    TEST_CHECK(router.handle_intermediate_cert(req).status == proto::FetchStatus::Ok);
+    TEST_CHECK(router.handle_intermediate_cert(req).status ==
+               proto::FetchStatus::OK);
     TEST_CHECK(router.handle_intermediate_cert(req).from_cache);
 
     auto events = sink.events();
     TEST_CHECK_EQ(events.size(), size_t{2});
     if (events.size() == 2) {
-        const auto& first = events[0];
+        auto const& first = events[0];
         TEST_CHECK_EQ(first.event, std::string("fetch"));
         TEST_CHECK_EQ(first.get("type"), std::string("aia"));
         TEST_CHECK_EQ(first.get("url"), req.aia_url);
@@ -521,14 +597,14 @@ void test_router_audits_network_fetch_then_cache_hit() {
         TEST_CHECK_EQ(first.get("bytes"), std::to_string(cert.size()));
         TEST_CHECK_EQ(first.get("http_status"), std::string("200"));
         TEST_CHECK(!first.has("reason"));
-        TEST_CHECK(!first.has("serial")); // serial — только для ocsp
+        TEST_CHECK(!first.has("serial"));  // serial — только для ocsp
         TEST_CHECK(!first.has("batch_size"));
 
-        const auto& second = events[1];
+        auto const& second = events[1];
         TEST_CHECK_EQ(second.get("decision"), std::string("cache_hit"));
         TEST_CHECK_EQ(second.get("result"), std::string("ok"));
         TEST_CHECK_EQ(second.get("bytes"), std::to_string(cert.size()));
-        TEST_CHECK(!second.has("http_status")); // сети не было
+        TEST_CHECK(!second.has("http_status"));  // сети не было
     }
     TEST_CHECK_EQ(http.calls.load(), 1);
 }
@@ -537,30 +613,36 @@ void test_router_audits_ordinary_network_failures_without_blocked_reason() {
     MemoryCache cache;
     FakeHttpFetcher http;
     MemorySink sink;
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &sink);
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &sink);
 
-    http.on_fetch = [](const std::string&) { return failed_result(); };
+    http.on_fetch = [](std::string const&) { return failed_result(); };
     proto::FetchCrlRequest req;
     req.distribution_point_url = "http://crl.example.test/a.crl";
-    TEST_CHECK(router.handle_crl(req).status == proto::FetchStatus::NetworkError);
+    TEST_CHECK(router.handle_crl(req).status ==
+               proto::FetchStatus::NETWORK_ERROR);
 
-    http.on_fetch = [](const std::string&) {
+    http.on_fetch = [](std::string const&) {
         http::HttpResult r;
         r.timed_out = true;
         return r;
     };
     req.distribution_point_url = "http://crl.example.test/b.crl";
-    TEST_CHECK(router.handle_crl(req).status == proto::FetchStatus::Timeout);
+    TEST_CHECK(router.handle_crl(req).status == proto::FetchStatus::TIMEOUT);
 
-    http.on_fetch = [](const std::string&) { return ok_result({1, 2, 3}, 200); }; // не сертификат
+    http.on_fetch = [](std::string const&) {
+        return ok_result({1, 2, 3}, 200);
+    };  // не сертификат
     proto::FetchIntermediateCertRequest aia;
     aia.aia_url = "http://ca.example.test/garbage.cer";
-    TEST_CHECK(router.handle_intermediate_cert(aia).status == proto::FetchStatus::InvalidResponse);
+    TEST_CHECK(router.handle_intermediate_cert(aia).status ==
+               proto::FetchStatus::INVALID_RESPONSE);
 
     auto events = sink.events();
     TEST_CHECK_EQ(events.size(), size_t{3});
     if (events.size() == 3) {
-        // Сбой сети — это network_fetch с ошибкой, а НЕ blocked (демон не отказывался).
+        // Сбой сети — это network_fetch с ошибкой, а НЕ blocked (демон не
+        // отказывался).
         TEST_CHECK_EQ(events[0].get("decision"), std::string("network_fetch"));
         TEST_CHECK_EQ(events[0].get("result"), std::string("network_error"));
         TEST_CHECK(!events[0].has("reason"));
@@ -571,7 +653,9 @@ void test_router_audits_ordinary_network_failures_without_blocked_reason() {
 
         TEST_CHECK_EQ(events[2].get("decision"), std::string("network_fetch"));
         TEST_CHECK_EQ(events[2].get("result"), std::string("invalid_response"));
-        TEST_CHECK_EQ(events[2].get("http_status"), std::string("200")); // сервер ответил, но разобрать нельзя
+        TEST_CHECK_EQ(
+            events[2].get("http_status"),
+            std::string("200"));  // сервер ответил, но разобрать нельзя
     }
 }
 
@@ -580,23 +664,30 @@ void test_router_audits_blocked_reasons_from_http_layer() {
     MemoryCache cache;
     FakeHttpFetcher http;
     MemorySink sink;
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &sink);
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &sink);
 
-    struct Case { http::FailureReason reason; const char* expected; };
-    const Case cases[] = {
-        {http::FailureReason::InvalidUrl, "invalid_url"},
-        {http::FailureReason::HttpsDisabled, "https_disabled"},
-        {http::FailureReason::HttpsUnavailable, "https_unavailable"},
-        {http::FailureReason::PortDenied, "port_denied"},
-        {http::FailureReason::AddressDenied, "address_denied"},
+    struct Case {
+        http::FailureReason reason;
+        char const* expected;
+    };
+    Case const cases[] = {
+        {http::FailureReason::INVALID_URL, "invalid_url"},
+        {http::FailureReason::HTTPS_DISABLED, "https_disabled"},
+        {http::FailureReason::HTTPS_UNAVAILABLE, "https_unavailable"},
+        {http::FailureReason::PORT_DENIED, "port_denied"},
+        {http::FailureReason::ADDRESS_DENIED, "address_denied"},
     };
     int i = 0;
-    for (const auto& c : cases) {
-        http.on_fetch = [&](const std::string&) { return failed_result(c.reason); };
+    for (auto const& c : cases) {
+        http.on_fetch = [&](std::string const&) {
+            return failed_result(c.reason);
+        };
         proto::FetchCrlRequest req;
-        req.distribution_point_url = "http://host" + std::to_string(i++) + ".example.test/x.crl";
+        req.distribution_point_url =
+            "http://host" + std::to_string(i++) + ".example.test/x.crl";
         auto resp = router.handle_crl(req);
-        TEST_CHECK(resp.status == proto::FetchStatus::NetworkError);
+        TEST_CHECK(resp.status == proto::FetchStatus::NETWORK_ERROR);
     }
 
     auto events = sink.events();
@@ -616,14 +707,15 @@ void test_router_audits_circuit_open_as_blocked() {
     cfg.circuit_breaker_failure_threshold = 2;
     cfg.circuit_breaker_cooldown_seconds = 60;
     cert_helper::RequestRouter router(cache, http, cfg, nullptr, &sink);
-    http.on_fetch = [](const std::string&) { return failed_result(); };
+    http.on_fetch = [](std::string const&) { return failed_result(); };
 
-    for (const char* path : {"/1.crl", "/2.crl", "/3.crl"}) {
+    for (char const* path : {"/1.crl", "/2.crl", "/3.crl"}) {
         proto::FetchCrlRequest req;
-        req.distribution_point_url = std::string("http://flaky.example.test") + path;
+        req.distribution_point_url =
+            std::string("http://flaky.example.test") + path;
         router.handle_crl(req);
     }
-    TEST_CHECK_EQ(http.calls.load(), 2); // третий запрос до сети не дошёл
+    TEST_CHECK_EQ(http.calls.load(), 2);  // третий запрос до сети не дошёл
 
     auto events = sink.events();
     TEST_CHECK_EQ(events.size(), size_t{3});
@@ -640,23 +732,27 @@ void test_router_audits_ldap_disabled_and_ldap_policy_denial() {
     FakeHttpFetcher http;
     MemorySink sink;
     proto::FetchCrlRequest req;
-    req.distribution_point_url = "ldap://dir.example.test/cn=CA?certificateRevocationList";
+    req.distribution_point_url =
+        "ldap://dir.example.test/cn=CA?certificateRevocationList";
 
     {
-        cert_helper::RequestRouter router(cache, http, fast_config(), /*ldap=*/nullptr, &sink);
+        cert_helper::RequestRouter router(cache, http, fast_config(),
+                                          /*ldap=*/nullptr, &sink);
         router.handle_crl(req);
     }
     {
         FakeLdapFetcher ldap;
         ldap.result.ok = false;
         ldap.result.policy_denied = true;
-        cert_helper::RequestRouter router(cache, http, fast_config(), &ldap, &sink);
+        cert_helper::RequestRouter router(cache, http, fast_config(), &ldap,
+                                          &sink);
         router.handle_crl(req);
     }
     {
-        FakeLdapFetcher ldap; // обычный сбой сети — не blocked
+        FakeLdapFetcher ldap;  // обычный сбой сети — не blocked
         ldap.result.ok = false;
-        cert_helper::RequestRouter router(cache, http, fast_config(), &ldap, &sink);
+        cert_helper::RequestRouter router(cache, http, fast_config(), &ldap,
+                                          &sink);
         router.handle_crl(req);
     }
 
@@ -670,7 +766,7 @@ void test_router_audits_ldap_disabled_and_ldap_policy_denial() {
         TEST_CHECK_EQ(events[2].get("decision"), std::string("network_fetch"));
         TEST_CHECK(!events[2].has("reason"));
     }
-    TEST_CHECK_EQ(http.calls.load(), 0); // ldap:// не ходит через HTTP-фетчер
+    TEST_CHECK_EQ(http.calls.load(), 0);  // ldap:// не ходит через HTTP-фетчер
 }
 
 // N одновременных одинаковых запросов: сеть дёргается один раз, одно
@@ -680,33 +776,41 @@ void test_router_audits_singleflight_followers_as_shared_inflight() {
     MemoryCache cache;
     FakeHttpFetcher http;
     MemorySink sink;
-    http.on_fetch = [](const std::string&) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(300)); // запас против шедулинга в CI
+    http.on_fetch = [](std::string const&) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(300));  // запас против шедулинга в CI
         return ok_result({9, 8, 7, 6, 5});
     };
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &sink);
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &sink);
 
-    constexpr int kThreads = 4;
+    constexpr int THREAD_COUNT = 4;
     std::vector<std::thread> threads;
-    for (int t = 0; t < kThreads; ++t) {
+    for (int t = 0; t < THREAD_COUNT; ++t) {
         threads.emplace_back([&router] {
             proto::FetchCrlRequest req;
             req.distribution_point_url = "http://crl.example.test/herd.crl";
             router.handle_crl(req);
         });
     }
-    for (auto& th : threads) th.join();
+    for (auto& th : threads) {
+        th.join();
+    }
 
     TEST_CHECK_EQ(http.calls.load(), 1);
-    TEST_CHECK_EQ(sink.events().size(), static_cast<size_t>(kThreads));
+    TEST_CHECK_EQ(sink.events().size(), static_cast<size_t>(THREAD_COUNT));
     TEST_CHECK_EQ(sink.count_decision("network_fetch"), 1);
     TEST_CHECK(sink.count_decision("shared_inflight") >= 1);
-    // Остаток (если поток запоздал настолько, что застал уже заполненный кэш) — cache_hit.
-    TEST_CHECK_EQ(sink.count_decision("network_fetch") + sink.count_decision("shared_inflight") +
+    // Остаток (если поток запоздал настолько, что застал уже заполненный кэш) —
+    // cache_hit.
+    TEST_CHECK_EQ(sink.count_decision("network_fetch") +
+                      sink.count_decision("shared_inflight") +
                       sink.count_decision("cache_hit"),
-                  kThreads);
-    for (const auto& e : sink.events()) {
-        if (e.get("decision") == "shared_inflight") TEST_CHECK(!e.has("http_status"));
+                  THREAD_COUNT);
+    for (auto const& e : sink.events()) {
+        if (e.get("decision") == "shared_inflight") {
+            TEST_CHECK(!e.has("http_status"));
+        }
     }
 }
 
@@ -715,16 +819,19 @@ void test_router_audits_ocsp_with_certificate_serial() {
     FakeHttpFetcher http;
     MemorySink sink;
     auto fx = test_util::generate_ocsp_batch_fixtures(6, 8);
-    http.on_fetch = [&](const std::string&) { return ok_result(fx.combined_response); };
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &sink);
+    http.on_fetch = [&](std::string const&) {
+        return ok_result(fx.combined_response);
+    };
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &sink);
 
     proto::FetchOcspRequest a;
     a.responder_url = "http://ocsp.example.test/";
     a.request_der = fx.request_a;
     proto::FetchOcspRequest b = a;
     b.request_der = fx.request_b;
-    TEST_CHECK(router.handle_ocsp(a).status == proto::FetchStatus::Ok);
-    TEST_CHECK(router.handle_ocsp(b).status == proto::FetchStatus::Ok);
+    TEST_CHECK(router.handle_ocsp(a).status == proto::FetchStatus::OK);
+    TEST_CHECK(router.handle_ocsp(b).status == proto::FetchStatus::OK);
 
     auto events = sink.events();
     TEST_CHECK_EQ(events.size(), size_t{2});
@@ -745,8 +852,11 @@ void test_router_audits_ocsp_batch_per_certificate() {
     FakeHttpFetcher http;
     MemorySink sink;
     auto fx = test_util::generate_ocsp_batch_fixtures(6, 8);
-    http.on_fetch = [&](const std::string&) { return ok_result(fx.combined_response); };
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &sink);
+    http.on_fetch = [&](std::string const&) {
+        return ok_result(fx.combined_response);
+    };
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &sink);
 
     proto::FetchOcspBatchRequest batch;
     proto::FetchOcspRequest a;
@@ -758,7 +868,7 @@ void test_router_audits_ocsp_batch_per_certificate() {
 
     auto first = router.handle_ocsp_batch(batch);
     TEST_CHECK_EQ(first.responses.size(), size_t{2});
-    TEST_CHECK_EQ(http.calls.load(), 1); // один объединённый запрос
+    TEST_CHECK_EQ(http.calls.load(), 1);  // один объединённый запрос
 
     auto events = sink.events();
     TEST_CHECK_EQ(events.size(), size_t{2});
@@ -772,7 +882,7 @@ void test_router_audits_ocsp_batch_per_certificate() {
         TEST_CHECK_EQ(events[0].get("http_status"), std::string("200"));
     }
 
-    router.handle_ocsp_batch(batch); // всё уже в кэше
+    router.handle_ocsp_batch(batch);  // всё уже в кэше
     TEST_CHECK_EQ(http.calls.load(), 1);
     auto all = sink.events();
     TEST_CHECK_EQ(all.size(), size_t{4});
@@ -789,8 +899,11 @@ void test_router_audits_failed_ocsp_batch_for_every_member() {
     FakeHttpFetcher http;
     MemorySink sink;
     auto fx = test_util::generate_ocsp_batch_fixtures(6, 8);
-    http.on_fetch = [](const std::string&) { return failed_result(http::FailureReason::AddressDenied); };
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &sink);
+    http.on_fetch = [](std::string const&) {
+        return failed_result(http::FailureReason::ADDRESS_DENIED);
+    };
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &sink);
 
     proto::FetchOcspBatchRequest batch;
     proto::FetchOcspRequest a;
@@ -803,25 +916,27 @@ void test_router_audits_failed_ocsp_batch_for_every_member() {
 
     auto events = sink.events();
     TEST_CHECK_EQ(events.size(), size_t{2});
-    for (const auto& e : events) {
+    for (auto const& e : events) {
         TEST_CHECK_EQ(e.get("decision"), std::string("blocked"));
         TEST_CHECK_EQ(e.get("reason"), std::string("address_denied"));
         TEST_CHECK_EQ(e.get("batch_size"), std::string("2"));
     }
 }
 
-// Отказ самого аудита (исключение из приёмника) не должен ломать обработку запроса.
+// Отказ самого аудита (исключение из приёмника) не должен ломать обработку
+// запроса.
 void test_router_survives_throwing_audit_sink() {
     MemoryCache cache;
     FakeHttpFetcher http;
     ThrowingSink sink;
-    http.on_fetch = [](const std::string&) { return ok_result({1, 2, 3, 4}); };
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &sink);
+    http.on_fetch = [](std::string const&) { return ok_result({1, 2, 3, 4}); };
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &sink);
 
     proto::FetchCrlRequest req;
     req.distribution_point_url = "http://crl.example.test/x.crl";
     auto resp = router.handle_crl(req);
-    TEST_CHECK(resp.status == proto::FetchStatus::Ok);
+    TEST_CHECK(resp.status == proto::FetchStatus::OK);
     TEST_CHECK_EQ(resp.payload_der.size(), size_t{4});
 }
 
@@ -829,11 +944,11 @@ void test_router_survives_throwing_audit_sink() {
 void test_router_without_audit_sink_behaves_as_before() {
     MemoryCache cache;
     FakeHttpFetcher http;
-    http.on_fetch = [](const std::string&) { return ok_result({1, 2, 3}); };
+    http.on_fetch = [](std::string const&) { return ok_result({1, 2, 3}); };
     cert_helper::RequestRouter router(cache, http, fast_config());
     proto::FetchCrlRequest req;
     req.distribution_point_url = "http://crl.example.test/x.crl";
-    TEST_CHECK(router.handle_crl(req).status == proto::FetchStatus::Ok);
+    TEST_CHECK(router.handle_crl(req).status == proto::FetchStatus::OK);
     TEST_CHECK(router.handle_crl(req).from_cache);
 }
 
@@ -846,15 +961,20 @@ void test_end_to_end_router_to_file_with_hostile_url() {
 
     MemoryCache cache;
     FakeHttpFetcher http;
-    http.on_fetch = [](const std::string&) { return failed_result(http::FailureReason::InvalidUrl); };
-    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr, &audit_log);
+    http.on_fetch = [](std::string const&) {
+        return failed_result(http::FailureReason::INVALID_URL);
+    };
+    cert_helper::RequestRouter router(cache, http, fast_config(), nullptr,
+                                      &audit_log);
 
     proto::FetchCrlRequest req;
-    req.distribution_point_url = "http://evil.example.test/\n{\"seq\":1,\"event\":\"fake\"}\r\n";
+    req.distribution_point_url =
+        "http://evil.example.test/\n{\"seq\":1,\"event\":\"fake\"}\r\n";
     router.handle_crl(req);
 
     auto lines = read_lines(dir.file("audit.log"));
-    TEST_CHECK_EQ(lines.size(), size_t{1}); // ровно одна строка, поддельных нет
+    TEST_CHECK_EQ(lines.size(),
+                  size_t{1});  // ровно одна строка, поддельных нет
     if (lines.size() == 1) {
         TEST_CHECK_EQ(jget(lines[0], "event"), std::string("fetch"));
         TEST_CHECK_EQ(jget(lines[0], "decision"), std::string("blocked"));
@@ -863,7 +983,7 @@ void test_end_to_end_router_to_file_with_hostile_url() {
     }
 }
 
-} // namespace
+}  // namespace
 
 int main() {
     RUN_TEST(test_format_audit_line_exact);
@@ -879,7 +999,8 @@ int main() {
     RUN_TEST(test_file_log_concurrent_records_are_intact_and_ordered);
     RUN_TEST(test_file_log_write_failure_is_counted_reported_once_and_recovers);
     RUN_TEST(test_router_audits_network_fetch_then_cache_hit);
-    RUN_TEST(test_router_audits_ordinary_network_failures_without_blocked_reason);
+    RUN_TEST(
+        test_router_audits_ordinary_network_failures_without_blocked_reason);
     RUN_TEST(test_router_audits_blocked_reasons_from_http_layer);
     RUN_TEST(test_router_audits_circuit_open_as_blocked);
     RUN_TEST(test_router_audits_ldap_disabled_and_ldap_policy_denial);
