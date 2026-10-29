@@ -99,11 +99,22 @@ if(CERT_HELPER_BUILD_TESTS)
     add_cert_helper_test(test_cache_warmup tests/test_cache_warmup.cpp)
     add_cert_helper_test(test_cache_export tests/test_cache_export.cpp)
     add_cert_helper_test(test_net_policy tests/test_net_policy.cpp)
+    add_cert_helper_test(test_command_line_options
+                         tests/test_command_line_options.cpp
+                         src/command_line_options.cpp)
+    target_link_libraries(test_command_line_options
+                          PRIVATE Boost::program_options)
+    add_cert_helper_test(test_service_unit tests/test_service_unit.cpp
+                         src/command_line_options.cpp)
+    target_link_libraries(test_service_unit PRIVATE Boost::program_options)
+    target_compile_definitions(test_service_unit PRIVATE
+        CERT_HELPER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_cert_helper_test(test_request_router tests/test_request_router.cpp)
     add_cert_helper_test(test_two_tier_cache tests/test_two_tier_cache.cpp)
     add_cert_helper_test(test_http_cache_hints tests/test_http_cache_hints.cpp)
     add_cert_helper_test(test_http_url_injection tests/test_http_url_injection.cpp)
     add_cert_helper_test(test_http_chunked tests/test_http_chunked.cpp)
+    add_cert_helper_test(test_http_slow_server tests/test_http_slow_server.cpp)
     add_cert_helper_test(test_http_keepalive tests/test_http_keepalive.cpp)
     add_cert_helper_test(test_https_support tests/test_https_support.cpp)
     add_cert_helper_test(test_ldap_support tests/test_ldap_support.cpp)

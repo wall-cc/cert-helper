@@ -90,6 +90,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -285,6 +286,14 @@ inline std::optional<ParsedUrl> parse_http_url(std::string const& url) {
 // соединений в первой версии), с таймаутом на подключение и на чтение.
 class SimpleHttpFetcher : public IHttpFetcher {
 public:
+    // ПУНКТ 5 ПЛАНА ДОРАБОТКИ (P1): объявлен здесь, в самом начале класса,
+    // а не рядом с make_deadline()/remaining_ms() ниже — сигнатуры методов
+    // класса (в отличие от их ТЕЛ) разбираются строго по порядку
+    // объявления, так что тип, используемый как параметр метода,
+    // объявленного раньше (fetch_over_new_connection, connect_with_timeout
+    // и т.д.), должен быть виден компилятору уже к этому моменту.
+    using Deadline = std::chrono::steady_clock::time_point;
+
     explicit SimpleHttpFetcher(net::NetworkPolicy policy,
                                bool allow_https = false,
                                std::string https_ca_bundle_path = "",
@@ -320,6 +329,11 @@ public:
                      std::string const& post_content_type, uint32_t timeout_ms,
                      size_t max_response_bytes) override {
         HttpResult result;
+        // ПУНКТ 5 ПЛАНА ДОРАБОТКИ (P1): единая точка отсчёта на ВСЮ
+        // операцию (connect + TLS-рукопожатие + отправка запроса + чтение
+        // ответа), а не timeout_ms заново на каждый отдельный
+        // recv()/connect() — см. комментарий у Deadline выше.
+        Deadline const deadline = make_deadline(timeout_ms);
 
         auto parsed = parse_http_url(url);
         if (!parsed) {
@@ -366,18 +380,25 @@ public:
         // подробный комментарий в начале файла про то, почему это не
         // требует изменений в IHttpFetcher/RequestRouter (прозрачно
         // внутри SimpleHttpFetcher).
-        if (auto pooled = checkout_pooled_connection(pool_key)) {
+        if (auto pooled = checkout_pooled_connection(pool_key);
+            pooled && remaining_ms(deadline) > 0) {
             Transport transport{pooled->fd, pooled->ssl};
-            set_socket_timeout(pooled->fd,
-                               timeout_ms);  // таймаут мог отличаться от
-                                             // прошлого использования
+            // Re-arm на ОСТАТОК общего дедлайна, а не исходный timeout_ms
+            // заново — таймаут мог отличаться от прошлого использования
+            // этого соединения, да и часть бюджета уже могла уйти на
+            // policy/парсинг URL выше. remaining_ms() > 0 уже проверено в
+            // условии if — set_socket_timeout(fd, 0) означал бы "таймаут
+            // отключён" (SO_RCVTIMEO с нулевым timeval), ровно
+            // противоположное тому, что нужно.
+            set_socket_timeout(pooled->fd, remaining_ms(deadline));
 
             bool timed_out = false;
             bool should_close = true;
             std::optional<HttpResult> reused_result;
-            if (send_all(transport, request)) {
-                reused_result = recv_and_parse_response(
-                    transport, max_response_bytes, timed_out, should_close);
+            if (send_all(transport, request, deadline)) {
+                reused_result =
+                    recv_and_parse_response(transport, max_response_bytes,
+                                            timed_out, should_close, deadline);
             }
 
             if (reused_result) {
@@ -412,7 +433,7 @@ public:
             // этого блока.
         }
 
-        return fetch_over_new_connection(*parsed, pool_key, request, timeout_ms,
+        return fetch_over_new_connection(*parsed, pool_key, request, deadline,
                                          max_response_bytes);
     }
 
@@ -420,12 +441,12 @@ private:
     HttpResult fetch_over_new_connection(ParsedUrl const& parsed,
                                          std::string const& pool_key,
                                          std::string const& request,
-                                         uint32_t timeout_ms,
+                                         Deadline deadline,
                                          size_t max_response_bytes) {
         HttpResult result;
 
         bool policy_denied = false;
-        int fd = connect_with_timeout(parsed.host, parsed.port, timeout_ms,
+        int fd = connect_with_timeout(parsed.host, parsed.port, deadline,
                                       policy, &policy_denied);
         if (fd < 0) {
             if (policy_denied) {
@@ -433,7 +454,16 @@ private:
             }
             return result;
         }
-        set_socket_timeout(fd, timeout_ms);
+        uint32_t const left_after_connect = remaining_ms(deadline);
+        if (left_after_connect == 0) {
+            // Дедлайн истёк ровно во время connect() (граничный случай:
+            // connect() успел отработать впритык к концу бюджета) —
+            // закрываем и отдаём таймаут, не пытаясь начать TLS/отправку.
+            ::close(fd);
+            result.timed_out = true;
+            return result;
+        }
+        set_socket_timeout(fd, left_after_connect);
 
         // Оборачиваем сокет в TLS, если это https:// — Transport ниже
         // прозрачно перенаправляет send/recv либо на SSL_write/SSL_read,
@@ -490,7 +520,7 @@ private:
             transport.ssl = ssl;
         }
 
-        bool send_ok = send_all(transport, request);
+        bool send_ok = send_all(transport, request, deadline);
         if (!send_ok) {
             if (transport.ssl) {
                 SSL_shutdown(transport.ssl);
@@ -502,7 +532,7 @@ private:
         bool timed_out = false;
         bool should_close = true;
         auto parsed_result = recv_and_parse_response(
-            transport, max_response_bytes, timed_out, should_close);
+            transport, max_response_bytes, timed_out, should_close, deadline);
 
         if (!parsed_result) {
             if (transport.ssl) {
@@ -618,7 +648,7 @@ private:
     // должно давать способ обойти policy (см. подробное обоснование в
     // dns_cache.hpp).
     int connect_with_timeout(std::string const& host, uint16_t port,
-                             uint32_t timeout_ms,
+                             Deadline deadline,
                              net::NetworkPolicy const& policy,
                              bool* policy_denied = nullptr) {
         if (policy_denied != nullptr) {
@@ -648,13 +678,24 @@ private:
                 continue;
             }
 
+            // ПУНКТ 5 ПЛАНА ДОРАБОТКИ (P1): бюджет на попытку connect() —
+            // ОСТАТОК общего дедлайна, не исходный timeout_ms заново на
+            // КАЖДЫЙ резолвленный адрес. Несколько медленных/недоступных
+            // адресов иначе суммарно съедали бы кратно больше заявленного
+            // timeout_ms. Если бюджет уже исчерпан — не открываем новый
+            // сокет вовсе, ни с одним из оставшихся адресов.
+            uint32_t const left = remaining_ms(deadline);
+            if (left == 0) {
+                break;
+            }
+
             attempted_any = true;
             fd = ::socket(addr.family, SOCK_STREAM, 0);
             if (fd < 0) {
                 continue;
             }
 
-            set_socket_timeout(fd, timeout_ms);
+            set_socket_timeout(fd, left);
             if (::connect(fd, reinterpret_cast<struct sockaddr*>(&ss),
                           ss_len) == 0) {
                 break;
@@ -677,6 +718,58 @@ private:
             }
         }
         return fd;
+    }
+
+    // ПУНКТ 5 ПЛАНА ДОРАБОТКИ (P1): таймаут был реализован как SO_RCVTIMEO/
+    // SO_SNDTIMEO, выставленный ОДИН раз на весь timeout_ms и больше не
+    // трогаемый — то есть ограничивал длительность КАЖДОГО ОТДЕЛЬНОГО
+    // recv()/connect(), а не всей операции fetch() целиком. Сервер,
+    // отвечающий чуть быстрее, чем истекает таймаут сокета (например, по
+    // одному байту каждые 0.8 с при timeout_ms=1000), удерживал поток
+    // воркера сколь угодно долго — воспроизведено: 9.6 с вместо
+    // объявленной 1 с. При ограниченном пуле воркеров несколько таких
+    // медленных ответчиков исчерпывают весь пул.
+    //
+    // Фикс — Deadline: единая точка отсчёта "сейчас + timeout_ms",
+    // посчитанная ОДИН раз в начале fetch(), и remaining_ms(), который
+    // вызывается перед КАЖДОЙ потенциально блокирующей операцией
+    // (попытка connect() на очередной адрес, send_all(), каждая итерация
+    // recv() в recv_and_parse_response()) и перевооружает сокет на
+    // ОСТАТОК времени, а не на исходный timeout_ms заново. Если остаток
+    // уже исчерпан — операция не выполняется вовсе (even не делаем
+    // лишний syscall), сразу считается таймаутом.
+    static Deadline make_deadline(uint32_t timeout_ms) {
+        return std::chrono::steady_clock::now() +
+               std::chrono::milliseconds(timeout_ms);
+    }
+
+    // 0, если дедлайн уже прошёл (вызывающий код обязан трактовать это
+    // как немедленный таймаут, не делая syscall); иначе — остаток в мс,
+    // не менее 1.
+    static uint32_t remaining_ms(Deadline deadline) {
+        auto const now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return 0;
+        }
+        auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - now)
+                              .count();
+        return static_cast<uint32_t>(
+            std::min<int64_t>(left, std::numeric_limits<uint32_t>::max()));
+    }
+
+    // Перевооружает сокет на остаток времени до deadline и читает; если
+    // остаток уже 0 — сразу таймаут, без единого лишнего syscall.
+    static ssize_t transport_recv_with_deadline(Transport& t, void* buf,
+                                                size_t len, bool& out_timed_out,
+                                                Deadline deadline) {
+        uint32_t const left = remaining_ms(deadline);
+        if (left == 0) {
+            out_timed_out = true;
+            return -1;
+        }
+        set_socket_timeout(t.fd, left);
+        return transport_recv(t, buf, len, out_timed_out);
     }
 
     static void set_socket_timeout(int fd, uint32_t timeout_ms) {
@@ -710,9 +803,16 @@ private:
         return req;
     }
 
-    static bool send_all(Transport& transport, std::string const& data) {
+    static bool send_all(Transport& transport, std::string const& data,
+                         Deadline deadline) {
         size_t sent = 0;
         while (sent < data.size()) {
+            uint32_t const left = remaining_ms(deadline);
+            if (left == 0) {
+                return false;  // общий дедлайн исчерпан — см. комментарий
+                               // у Deadline выше
+            }
+            set_socket_timeout(transport.fd, left);
             ssize_t w = transport_send(transport, data.data() + sent,
                                        data.size() - sent);
             if (w < 0) {
@@ -852,15 +952,15 @@ private:
     // "Connection: keep-alive" (для HTTP/1.0 keep-alive не дефолтен).
     static std::optional<HttpResult> recv_and_parse_response(
         Transport& transport, size_t max_response_bytes, bool& timed_out,
-        bool& should_close) {
+        bool& should_close, Deadline deadline) {
         should_close = true;
 
         std::string buffer;
         size_t header_end = std::string::npos;
         while (header_end == std::string::npos) {
             char chunk[8192];
-            ssize_t r =
-                transport_recv(transport, chunk, sizeof(chunk), timed_out);
+            ssize_t r = transport_recv_with_deadline(
+                transport, chunk, sizeof(chunk), timed_out, deadline);
             if (r <= 0) {
                 return std::nullopt;  // EOF/ошибка раньше, чем дочитали
                                       // заголовки целиком
@@ -919,8 +1019,8 @@ private:
             }
             while (body_so_far.size() < want) {
                 char chunk[8192];
-                ssize_t r =
-                    transport_recv(transport, chunk, sizeof(chunk), timed_out);
+                ssize_t r = transport_recv_with_deadline(
+                    transport, chunk, sizeof(chunk), timed_out, deadline);
                 if (r <= 0) {
                     return std::nullopt;
                 }
@@ -957,8 +1057,8 @@ private:
                     return result;
                 }
                 char chunk[8192];
-                ssize_t r =
-                    transport_recv(transport, chunk, sizeof(chunk), timed_out);
+                ssize_t r = transport_recv_with_deadline(
+                    transport, chunk, sizeof(chunk), timed_out, deadline);
                 if (r <= 0) {
                     return std::nullopt;
                 }
@@ -979,8 +1079,8 @@ private:
         // здесь и не стоит.
         while (true) {
             char chunk[8192];
-            ssize_t r =
-                transport_recv(transport, chunk, sizeof(chunk), timed_out);
+            ssize_t r = transport_recv_with_deadline(
+                transport, chunk, sizeof(chunk), timed_out, deadline);
             if (r == 0) {
                 break;  // EOF — тело получено целиком
             }

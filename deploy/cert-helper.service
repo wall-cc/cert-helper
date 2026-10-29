@@ -16,7 +16,8 @@ BusName=org.certhelper.CertHelper1
 
 ExecStart=/usr/local/bin/cert-helper \
     --cache-dir /var/lib/cert-helper/cache \
-    --worker-threads 4 \
+    --min-worker-threads 4 \
+    --max-worker-threads 4 \
     --max-cache-entries 100000 \
     --max-cache-bytes 536870912 \
     --aia-ttl-seconds 604800
